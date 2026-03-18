@@ -4,9 +4,12 @@ Warps a flat garment image so its shape conforms to the person's body,
 using control-point correspondences between cloth landmarks and body
 landmarks derived from pose estimation.
 
-Key design: we use exactly 8 paired landmarks (shoulder, armpit, mid-torso,
-hem — left and right) plus 1 collar center = 9 clean control points.
+Key design: we use exactly 9 paired landmarks (collar, shoulder, armpit,
+mid-torso, hem — left and right) plus 2 sleeve-tip landmarks mapped to
+elbow positions = 11 clean control points.
 No overlapping grid to avoid TPS "explosion".
+The sleeve-tip → elbow mapping ensures long-sleeve garments are not
+compressed into the torso width (prevents crop-top / bra artefacts).
 """
 from __future__ import annotations
 
@@ -64,24 +67,27 @@ def _apply_tps(
 # ── Cloth landmark detection ────────────────────────────────────────────
 
 def detect_cloth_landmarks(cloth_mask: np.ndarray) -> dict[str, tuple[float, float]]:
-    """Detect 9 landmarks on the garment from its mask silhouette.
+    """Detect 11 landmarks on the garment from its mask silhouette.
 
-    Returns: collar, shoulder_l/r, armpit_l/r, mid_l/r, hem_l/r.
+    Returns: collar, shoulder_l/r, armpit_l/r, mid_l/r, hem_l/r,
+             sleeve_tip_l/r (widest-row extremes for long-sleeve support).
     Order: top-to-bottom, left before right at each row.
     """
     ys, xs = np.where(cloth_mask > 0)
     if len(xs) < 80:
         h, w = cloth_mask.shape[:2]
         return {
-            "collar":         (w * 0.50, h * 0.05),
-            "shoulder_left":  (w * 0.15, h * 0.12),
-            "shoulder_right": (w * 0.85, h * 0.12),
-            "armpit_left":    (w * 0.12, h * 0.30),
-            "armpit_right":   (w * 0.88, h * 0.30),
-            "mid_left":       (w * 0.18, h * 0.55),
-            "mid_right":      (w * 0.82, h * 0.55),
-            "hem_left":       (w * 0.20, h * 0.92),
-            "hem_right":      (w * 0.80, h * 0.92),
+            "collar":           (w * 0.50, h * 0.05),
+            "shoulder_left":    (w * 0.15, h * 0.12),
+            "shoulder_right":   (w * 0.85, h * 0.12),
+            "armpit_left":      (w * 0.12, h * 0.30),
+            "armpit_right":     (w * 0.88, h * 0.30),
+            "mid_left":         (w * 0.18, h * 0.55),
+            "mid_right":        (w * 0.82, h * 0.55),
+            "hem_left":         (w * 0.20, h * 0.92),
+            "hem_right":        (w * 0.80, h * 0.92),
+            "sleeve_tip_left":  (w * 0.05, h * 0.30),
+            "sleeve_tip_right": (w * 0.95, h * 0.30),
         }
 
     x1, x2 = int(xs.min()), int(xs.max())
@@ -109,16 +115,31 @@ def detect_cloth_landmarks(cloth_mask: np.ndarray) -> dict[str, tuple[float, flo
     mdl, mdr = _row_lr(0.55)
     hml, hmr = _row_lr(0.88)
 
+    # Sleeve tips: find the widest row (captures sleeve extent for long-sleeve shirts).
+    # We scan the upper portion of the garment (20–45% height) where sleeves are
+    # widest. For t-shirts the result will be equal to or very near the armpit row.
+    max_width = 0.0
+    sleeve_frac = 0.30
+    for frac in np.arange(0.20, 0.50, 0.05):   # 0.20, 0.25, 0.30, 0.35, 0.40, 0.45
+        sl, sr = _row_lr(float(frac))
+        w_at_row = sr - sl
+        if w_at_row > max_width:
+            max_width = w_at_row
+            sleeve_frac = float(frac)
+    stl, str_ = _row_lr(sleeve_frac)
+
     return {
-        "collar":         (collar_x,                   collar_y),
-        "shoulder_left":  (shl, float(y1 + int(ch * 0.12))),
-        "shoulder_right": (shr, float(y1 + int(ch * 0.12))),
-        "armpit_left":    (apl, float(y1 + int(ch * 0.30))),
-        "armpit_right":   (apr, float(y1 + int(ch * 0.30))),
-        "mid_left":       (mdl, float(y1 + int(ch * 0.55))),
-        "mid_right":      (mdr, float(y1 + int(ch * 0.55))),
-        "hem_left":       (hml, float(y1 + int(ch * 0.88))),
-        "hem_right":      (hmr, float(y1 + int(ch * 0.88))),
+        "collar":           (collar_x,                   collar_y),
+        "shoulder_left":    (shl, float(y1 + int(ch * 0.12))),
+        "shoulder_right":   (shr, float(y1 + int(ch * 0.12))),
+        "armpit_left":      (apl, float(y1 + int(ch * 0.30))),
+        "armpit_right":     (apr, float(y1 + int(ch * 0.30))),
+        "mid_left":         (mdl, float(y1 + int(ch * 0.55))),
+        "mid_right":        (mdr, float(y1 + int(ch * 0.55))),
+        "hem_left":         (hml, float(y1 + int(ch * 0.88))),
+        "hem_right":        (hmr, float(y1 + int(ch * 0.88))),
+        "sleeve_tip_left":  (stl, float(y1 + int(ch * sleeve_frac))),
+        "sleeve_tip_right": (str_, float(y1 + int(ch * sleeve_frac))),
     }
 
 
@@ -129,11 +150,14 @@ def _compute_body_destinations(
     fit_scale: float,
     y_offset_ratio: float,
 ) -> np.ndarray:
-    """Compute 9 body-side destination points matching cloth landmarks.
+    """Compute 11 body-side destination points matching cloth landmarks.
 
     Order must be identical to detect_cloth_landmarks():
       collar, shoulder_l, shoulder_r, armpit_l, armpit_r,
-      mid_l, mid_r, hem_l, hem_r.
+      mid_l, mid_r, hem_l, hem_r, sleeve_tip_l, sleeve_tip_r.
+
+    The two sleeve_tip points map to elbow positions so that
+    long-sleeve garments are not compressed into the torso width.
     """
     ls = np.array(pose["left_shoulder"], dtype=np.float64)
     rs = np.array(pose["right_shoulder"], dtype=np.float64)
@@ -171,6 +195,20 @@ def _compute_body_destinations(
     hw_mid      = base_w * 0.54          # chest/waist keeps garment loose
     hw_hem      = base_w * 0.52
 
+    # Sleeve tip destinations: map to elbow positions so that
+    # long-sleeve garments are not squashed into the torso width.
+    # We take the LEFTMOST X of (elbow X, armpit boundary) for the left
+    # destination, and the RIGHTMOST X for the right destination.
+    # ┌ Arms at sides:   elbow X ≈ shoulder X (rightward of armpit bound) →
+    #   armpit boundary wins → same effective width as the armpit destination.
+    # ┌ Arms spread wide: elbow X extends beyond armpit bound →
+    #   elbow wins → sleeve tip destination pushes further out, preserving
+    #   the sleeve shape against the actual arm position.
+    sleeve_tip_l_x = min(float(le[0]), cx_top - hw_armpit)   # take the more-left X
+    sleeve_tip_r_x = max(float(re[0]), cx_top + hw_armpit)   # take the more-right X
+    sleeve_tip_y_l = float(le[1]) + dy
+    sleeve_tip_y_r = float(re[1]) + dy
+
     return np.array([
         [neck[0],               neck[1] + dy],                # collar
         [cx_top - hw_shoulder,  _lerp_y(0.0)],               # shoulder_left
@@ -181,6 +219,8 @@ def _compute_body_destinations(
         [cx_mid + hw_mid,       _lerp_y(0.55)],              # mid_right
         [cx_bot - hw_hem,       _lerp_y(0.95)],              # hem_left
         [cx_bot + hw_hem,       _lerp_y(0.95)],              # hem_right
+        [sleeve_tip_l_x,        sleeve_tip_y_l],             # sleeve_tip_left  → left elbow
+        [sleeve_tip_r_x,        sleeve_tip_y_r],             # sleeve_tip_right → right elbow
     ], dtype=np.float64)
 
 
@@ -197,8 +237,9 @@ def tps_warp_cloth(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Warp cloth image via TPS so it conforms to the body shape.
 
-    Uses 9 clean landmark pairs (no overlapping grid) to avoid TPS
-    distortion artefacts.
+    Uses 11 clean landmark pairs (no overlapping grid) to avoid TPS
+    distortion artefacts.  The extra 2 points (sleeve_tip_l/r → elbow)
+    ensure long-sleeve garments are not compressed into the torso width.
     """
     # Pre-multiply cloth by mask BEFORE warp to eliminate white
     # background bleeding through anti-aliased mask edges.
@@ -207,7 +248,7 @@ def tps_warp_cloth(
 
     landmarks = detect_cloth_landmarks(cloth_mask)
 
-    # Source: cloth landmarks (cloth image space)
+    # Source: cloth landmarks (cloth image space) — 11 points
     src_pts = np.array([
         landmarks["collar"],
         landmarks["shoulder_left"],
@@ -218,9 +259,11 @@ def tps_warp_cloth(
         landmarks["mid_right"],
         landmarks["hem_left"],
         landmarks["hem_right"],
+        landmarks.get("sleeve_tip_left",  landmarks["armpit_left"]),
+        landmarks.get("sleeve_tip_right", landmarks["armpit_right"]),
     ], dtype=np.float64)
 
-    # Destination: body landmarks (person image space)
+    # Destination: body landmarks (person image space) — 11 points
     dst_pts = _compute_body_destinations(pose, fit_scale, y_offset_ratio)
 
     h_out, w_out = output_shape
@@ -244,7 +287,7 @@ def tps_warp_cloth(
         borderMode=cv2.BORDER_CONSTANT, borderValue=0,
     )
 
-    # Transform all 9 source landmarks through affine → now in person space
+    # Transform all 11 source landmarks through affine → now in person space
     ones_col = np.ones((len(src_pts), 1), dtype=np.float64)
     src_hom = np.hstack([src_pts, ones_col])
     M64 = M_affine.astype(np.float64)
@@ -281,16 +324,18 @@ def tps_warp_cloth(
 
 
 def refine_warped_mask(mask: np.ndarray) -> np.ndarray:
-    """Clean up warped mask edges to prevent white halo.
+    """Clean up warped mask edges to prevent white halo and improve adhesion.
 
     Pipeline from HR-VITON / IDM-VTON:
-      1. Dilate slightly to fill tiny internal holes after warp
-      2. Erode more aggressively to shrink boundary inward — removes
-         anti-aliased fringe that carries white background pixels
+      1. Dilate to fill tiny internal holes after warp and extend coverage
+         so the garment adheres to the body without visible gaps
+      2. Erode slightly to remove anti-aliased fringe at the boundary
+         (cloth is pre-multiplied by mask so no white bleed, only dark fringe)
       3. Light Gaussian feather for smooth compositing edge
+    Net effect: +1 dilation ensures garment mask fully covers the warped cloth.
     """
     k3 = np.ones((3, 3), np.uint8)
-    mask = cv2.dilate(mask, k3, iterations=1)
-    mask = cv2.erode(mask, k3, iterations=2)
+    mask = cv2.dilate(mask, k3, iterations=2)   # fill holes + slight outward expansion
+    mask = cv2.erode(mask, k3, iterations=1)    # remove dark anti-alias fringe
     mask = cv2.GaussianBlur(mask, (3, 3), 0)
     return mask

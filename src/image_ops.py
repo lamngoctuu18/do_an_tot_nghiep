@@ -528,6 +528,17 @@ def build_skeleton_erase_mask(
             cv2.line(mask, tuple(shoulder_pt.astype(int)), tuple(ep.astype(int)),
                      255, thickness=arm_r * 2)
 
+    # Extend corridor from elbow to wrist to cover full long-sleeve area.
+    # Radius intentionally narrower (0.08 vs 0.12) since the sleeve tapers
+    # toward the cuff compared to the upper arm.
+    for wrist_key, elbow_key in [("left_wrist", "left_elbow"), ("right_wrist", "right_elbow")]:
+        if wrist_key in pose and elbow_key in pose:
+            ep = np.array(pose[elbow_key], dtype=np.float64)
+            wp = np.array(pose[wrist_key], dtype=np.float64)
+            arm_r = max(6, int(0.08 * sw))   # narrower than upper-arm corridor
+            cv2.line(mask, tuple(ep.astype(int)), tuple(wp.astype(int)),
+                     255, thickness=arm_r * 2)
+
     # Smooth edges
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8), iterations=1)
     return mask
@@ -563,7 +574,9 @@ def prefit_scale_cloth(
     # This prevents the garment from being squeezed smaller than its
     # natural shape while still fitting the body.
     target_w = max(body_width * 1.12, cloth_w * preserve_ratio)
-    target_h = measurements["torso_height"] * 1.25
+    # Height constraint: also preserve at least preserve_ratio of original cloth
+    # height so long-sleeve shirts are not compressed into crop-top / bra shapes.
+    target_h = max(measurements["torso_height"] * 1.25, cloth_h * preserve_ratio)
 
     sx = target_w / cloth_w
     sy = target_h / cloth_h
