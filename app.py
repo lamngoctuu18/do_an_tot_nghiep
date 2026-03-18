@@ -438,13 +438,13 @@ def try_on(
     #
     # Mask refinement: hard threshold → edge feathering.
     # This removes anti-aliased white halo from warped mask edges.
-    wm_binary = (warped_mask > 128).astype(np.uint8) * 255   # hard cut
-    # Erode 1px to pull mask inward away from white fringe
-    wm_erode = cv2.erode(wm_binary, np.ones((3, 3), np.uint8), iterations=1)
-    # Detect edge band via Canny and feather it
-    wm_edge = cv2.Canny(wm_erode, 50, 150)
-    wm_edge = cv2.dilate(wm_edge, np.ones((3, 3), np.uint8), iterations=1)
-    wm_feather = cv2.GaussianBlur(wm_erode, (5, 5), 0)
+    # Cloth is pre-multiplied by mask so there is no white bleed — we use
+    # a lower threshold and wider feather to close the gap between garment
+    # and body (avoids white-space visible at garment boundary).
+    wm_binary = (warped_mask > 30).astype(np.uint8) * 255    # include full garment
+    # Feather edges with a larger kernel so the transition is smooth and
+    # the garment adheres flush to the body without visible seams.
+    wm_feather = cv2.GaussianBlur(wm_binary, (9, 9), 0)
     cloth_alpha = (wm_feather.astype(np.float32) / 255.0)[..., None]
 
     init_tryon = (
