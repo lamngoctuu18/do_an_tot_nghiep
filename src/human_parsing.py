@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
+import os
 
 LABEL_MAP: dict[int, str] = {
     0: "background", 1: "hat", 2: "hair", 3: "sunglasses",
@@ -37,12 +38,15 @@ def _ensure_model() -> bool:
             SegformerImageProcessor,
             SegformerForSemanticSegmentation,
         )
+        cache_dir = os.getenv("HF_HUB_CACHE") or os.getenv("HUGGINGFACE_HUB_CACHE")
         print("[human_parsing] Downloading SegFormer model (first time only)…")
         _processor = SegformerImageProcessor.from_pretrained(
             "mattmdjaga/segformer_b2_clothes",
+            cache_dir=cache_dir,
         )
         _model = SegformerForSemanticSegmentation.from_pretrained(
             "mattmdjaga/segformer_b2_clothes",
+            cache_dir=cache_dir,
         )
         _model.eval()
         _ready = True
@@ -184,6 +188,32 @@ def get_neck_mask(parsing: dict[str, np.ndarray]) -> np.ndarray | None:
             neck_region = cv2.bitwise_or(neck_region, collar_band)
 
     return neck_region if int(neck_region.sum()) > 255 * 20 else None
+
+
+def get_pants_mask(parsing: dict[str, np.ndarray]) -> np.ndarray | None:
+    """Return a mask covering the lower-body region (pants/skirt/legs).
+
+    v16.11c: Added for pants try-on support.
+    Combines: pants, skirt, left_leg, right_leg — excluding shoes.
+    """
+    if not parsing:
+        return None
+    sample = next(iter(parsing.values()))
+    h, w = sample.shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    for key in ("pants", "skirt", "left_leg", "right_leg"):
+        if key in parsing:
+            mask = cv2.bitwise_or(mask, parsing[key])
+    # Preserve belt as part of pants waistband
+    if "belt" in parsing:
+        mask = cv2.bitwise_or(mask, parsing["belt"])
+    # Exclude shoes — they stay on top
+    for key in ("left_shoe", "right_shoe"):
+        if key in parsing:
+            mask = cv2.subtract(mask, parsing[key])
+    kernel = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    return mask if int(mask.sum()) > 255 * 100 else None
 
 
 def get_skin_mask(parsing: dict[str, np.ndarray]) -> np.ndarray | None:

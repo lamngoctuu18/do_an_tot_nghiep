@@ -36,19 +36,17 @@ def resolve_storage_config() -> StorageConfig:
 
 
 def _export_cache_vars(base_dir: Path) -> None:
-    hf_home = Path(os.getenv("HF_HOME", str(base_dir / "huggingface")))
-    transformers_cache = Path(
-        os.getenv("TRANSFORMERS_CACHE", str(hf_home / "transformers"))
-    )
-    huggingface_hub_cache = Path(
-        os.getenv("HUGGINGFACE_HUB_CACHE", str(hf_home / "hub"))
-    )
-    torch_home = Path(os.getenv("TORCH_HOME", str(base_dir / "torch")))
+    # Force model/cache downloads to the configured storage root (default on drive E).
+    hf_home = base_dir / "huggingface"
+    huggingface_hub_cache = hf_home / "hub"
+    torch_home = base_dir / "torch"
 
-    for directory in (hf_home, transformers_cache, huggingface_hub_cache, torch_home):
+    for directory in (hf_home, huggingface_hub_cache, torch_home):
         directory.mkdir(parents=True, exist_ok=True)
 
     os.environ["HF_HOME"] = str(hf_home)
-    os.environ["TRANSFORMERS_CACHE"] = str(transformers_cache)
+    # Newer Transformers deprecates TRANSFORMERS_CACHE in favor of HF_HOME.
+    os.environ.pop("TRANSFORMERS_CACHE", None)
     os.environ["HUGGINGFACE_HUB_CACHE"] = str(huggingface_hub_cache)
+    os.environ["HF_HUB_CACHE"] = str(huggingface_hub_cache)
     os.environ["TORCH_HOME"] = str(torch_home)

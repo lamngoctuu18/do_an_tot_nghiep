@@ -5,6 +5,7 @@ from functools import lru_cache
 import json
 import os
 
+import cv2
 import numpy as np
 from PIL import Image
 
@@ -16,15 +17,27 @@ HYPER_SD_REPO = "ByteDance/Hyper-SD"
 
 @dataclass
 class GenConfig:
-    num_inference_steps: int = 18
-    guidance_scale: float = 1.3
-    refiner_mode: str = "dpm++"  # one of: lcm, hypersd, dpm++, euler, base
-    strength: float = 0.35
+    num_inference_steps: int = 20
+    guidance_scale: float = 2.5
+    refiner_mode: str = "lcm"  # v16.10e: LCM for speed on 4GB
+    strength: float = 0.82  # v16.10e: folds without destroying sleeve shape
     cloth_type: str = "auto"
     use_cloth_lora: bool = True
+    # v16.13: Allow callers to request higher inference resolution on GPU for
+    # higher-fidelity generation (e.g. dress with complex prints like leopard).
+    # 0 (default) => use legacy 512 square on GPU. On CPU we always clamp to 512.
+    infer_size: int = 0
     negative_prompt: str = (
-        "different clothing, wrong color, wrong pattern, changed design, "
-        "deformed body, duplicate arms, duplicate torso, bad anatomy, blurry, low quality, artifacts"
+        "deformed garment, wrinkled mess, wrong sleeve length, sleeveless, "
+        "distorted fabric, pasted on, flat texture, sticker effect, "
+        "deformed body, duplicate arms, bad anatomy, blurry, low quality, artifacts, "
+        "multiple garments, layered clothing, old clothing visible, "
+        "color shift, rainbow pattern, tie dye, wrong color, altered print, "
+        "red trim, red collar, red cuffs, red border, red neckline, red hem, "
+        "contrast collar, contrast cuffs, two-tone garment, "
+        "handbag, purse, bag, clutch, tote, satchel, backpack, "
+        "accessories, jewelry, necklace, scarf, belt, hat, gloves, "
+        "extra objects, holding items, props, logo, text, watermark"
     )
 
 
@@ -48,20 +61,81 @@ def _get_pipeline(refiner_mode: str):
 
     use_cuda = torch.cuda.is_available()
     dtype = torch.float16 if use_cuda else torch.float32
+    device_label = "cuda" if use_cuda else "cpu"
+    print(f"[gen_tryon] Diffusion backend: {device_label} ({dtype})")
 
-    pipe = StableDiffusionInpaintPipeline.from_pretrained(
-        MODEL_ID,
-        torch_dtype=dtype,
-        safety_checker=None,
-        requires_safety_checker=False,
-    )
+    cache_dir = os.getenv("HF_HUB_CACHE") or os.getenv("HUGGINGFACE_HUB_CACHE")
 
-    # VRAM optimizations for weak GPUs / CPU fallback.
+    common_kwargs = {
+        "safety_checker": None,
+        "requires_safety_checker": False,
+        "cache_dir": cache_dir,
+    }
+
+    if use_cuda:
+        # v16.10: Load fp16 safetensors (available on HF) then cast to fp32.
+        # torch 2.5 blocks .bin loading (CVE-2025-32434). The repo only has
+        # fp16 safetensors, not fp32 safetensors. So: load fp16 → .to(fp32).
+        # With cpu_offload, only 1 module on GPU at a time → fp32 fits 4GB.
+        try:
+            pipe = StableDiffusionInpaintPipeline.from_pretrained(
+                MODEL_ID,
+                torch_dtype=torch.float16,
+                use_safetensors=True,
+                variant="fp16",
+                **common_kwargs,
+            )
+        except Exception:
+            # Some mirrors may not have variant metadata
+            pipe = StableDiffusionInpaintPipeline.from_pretrained(
+                MODEL_ID,
+                torch_dtype=torch.float16,
+                use_safetensors=True,
+                **common_kwargs,
+            )
+        # Cast entire pipeline to fp32 to avoid NaN in UNet
+        pipe = pipe.to(dtype=torch.float32)
+        print("[gen_tryon] Loaded fp16 safetensors → cast to fp32 (NaN-safe, no .bin needed)")
+    else:
+        # CPU: also load fp16 safetensors → cast to fp32 to avoid .bin loading
+        # (torch < 2.6 blocks .bin due to CVE-2025-32434)
+        try:
+            pipe = StableDiffusionInpaintPipeline.from_pretrained(
+                MODEL_ID,
+                torch_dtype=torch.float16,
+                use_safetensors=True,
+                variant="fp16",
+                **common_kwargs,
+            )
+            pipe = pipe.to(dtype=torch.float32)
+            print("[gen_tryon] CPU: loaded fp16 safetensors → cast to fp32")
+        except Exception as exc:
+            raise RuntimeError(
+                "Khong the load local diffusion. "
+                "Hay nang cap torch >= 2.6 hoac dam bao co safetensors trong cache."
+            ) from exc
+
+    # VRAM optimizations for 4GB GPU.
     pipe.enable_attention_slicing()
     try:
-        pipe.enable_vae_slicing()
+        pipe.vae.enable_slicing()
     except Exception:
         pass
+    try:
+        pipe.vae.enable_tiling()
+        print("[gen_tryon] VAE tiling enabled")
+    except Exception:
+        pass
+
+    # v16.10: Pipeline is fp32 — no NaN issues, no force_upcast needed.
+
+    # v16.10: xformers memory-efficient attention (saves ~30% VRAM)
+    if use_cuda:
+        try:
+            pipe.enable_xformers_memory_efficient_attention()
+            print("[gen_tryon] xformers enabled")
+        except Exception:
+            print("[gen_tryon] xformers not available, using default attention")
 
     if refiner_mode == "lcm":
         pipe.scheduler = LCMScheduler.from_config(pipe.scheduler.config)
@@ -83,20 +157,29 @@ def _get_pipeline(refiner_mode: str):
             from huggingface_hub import hf_hub_download
 
             ckpt_name = os.getenv("HYPERSD_CKPT", "Hyper-SD15-8steps-CFG-lora.safetensors")
-            lora_path = hf_hub_download(HYPER_SD_REPO, ckpt_name)
+            lora_path = hf_hub_download(HYPER_SD_REPO, ckpt_name, cache_dir=cache_dir)
             pipe.load_lora_weights(lora_path)
             pipe.fuse_lora(lora_scale=0.125)
         except Exception:
             pass
 
     if use_cuda:
+        # v16.10: cpu_offload is critical for 4GB GPU — moves modules to GPU only when needed
         try:
             pipe.enable_model_cpu_offload()
+            print("[gen_tryon] model_cpu_offload enabled")
         except Exception:
             try:
                 pipe.enable_sequential_cpu_offload()
+                print("[gen_tryon] sequential_cpu_offload enabled")
             except Exception:
                 pipe = pipe.to("cuda")
+        # channels_last memory format for ~10% speedup on GPU
+        try:
+            pipe.unet.to(memory_format=torch.channels_last)
+            print("[gen_tryon] UNet channels_last enabled")
+        except Exception:
+            pass
     else:
         pipe = pipe.to("cpu")
 
@@ -177,15 +260,14 @@ def _maybe_apply_cloth_lora(pipe, cloth_type: str, user_prompt: str, enabled: bo
 
 def _build_prompt(user_prompt: str) -> str:
     base = (
-        "person wearing the exact same garment from reference image, "
-        "preserve original color, pattern, logo, fabric texture exactly, "
-        "natural folds, realistic lighting"
+        "high quality photo of person wearing garment, "
+        "subtle natural fabric folds, soft cloth drape on body, "
+        "preserve original sleeve shape and length, "
+        "do not widen sleeves, do not lengthen sleeves, "
+        "photorealistic clothing, natural lighting, sharp details"
     )
     text = (user_prompt or "").strip()
-    if not text:
-        return base
-    # Avoid descriptive garment prompts that override the reference image.
-    return f"{base}, {text}"
+    return f"{base}, {text}" if text else base
 
 
 def generate_tryon_image(
@@ -194,6 +276,17 @@ def generate_tryon_image(
     user_prompt: str,
     config: GenConfig | None = None,
 ) -> np.ndarray:
+    # Clamp and sanitize inputs before entering diffusion.
+    init_tryon_rgb = np.nan_to_num(
+        init_tryon_rgb.astype(np.float32), nan=0.0, posinf=255.0, neginf=0.0,
+    )
+    init_tryon_rgb = np.clip(init_tryon_rgb, 0.0, 255.0).astype(np.uint8)
+
+    inpaint_mask_gray = np.nan_to_num(
+        inpaint_mask_gray.astype(np.float32), nan=0.0, posinf=255.0, neginf=0.0,
+    )
+    inpaint_mask_gray = np.clip(inpaint_mask_gray, 0.0, 255.0).astype(np.uint8)
+
     config = config or GenConfig()
     mode = (config.refiner_mode or "lcm").strip().lower()
     if mode not in {"lcm", "hypersd", "dpm++", "euler", "base"}:
@@ -204,8 +297,28 @@ def generate_tryon_image(
     mask_image = _to_pil_mask(inpaint_mask_gray)
 
     target_h, target_w = init_tryon_rgb.shape[:2]
-    infer_w = max(256, (target_w // 8) * 8)
-    infer_h = max(256, (target_h // 8) * 8)
+    # v16.10: Always resize to 512x512 for diffusion — optimal for SD-inpaint on 4GB GPU.
+    # Larger sizes waste VRAM and can cause OOM; smaller sizes cause numerical instability.
+    # v16.13: Allow caller-specified infer_size (e.g. 640 for dress with complex prints).
+    # On CPU we clamp to 512. On GPU we allow up to 768 (cpu_offload + xformers handle it).
+    try:
+        import torch as _torch
+        _use_cuda = _torch.cuda.is_available()
+    except Exception:
+        _use_cuda = False
+    _requested = int(getattr(config, "infer_size", 0) or 0)
+    if _requested <= 0:
+        INFER_SIZE = 512
+    elif not _use_cuda:
+        INFER_SIZE = 512  # CPU: always 512 for stability
+    else:
+        # Snap to multiple of 64 (SD requirement), clamp to [512, 768]
+        INFER_SIZE = int(np.clip((_requested // 64) * 64, 512, 768))
+    init_image = init_image.resize((INFER_SIZE, INFER_SIZE), Image.LANCZOS)
+    mask_image = mask_image.resize((INFER_SIZE, INFER_SIZE), Image.NEAREST)
+    infer_w = INFER_SIZE
+    infer_h = INFER_SIZE
+    print(f"[gen_tryon] Inference resolution: {INFER_SIZE}x{INFER_SIZE} (requested={_requested}, cuda={_use_cuda})")
 
     # Optional cloth-type LoRA (pretrained external adapters, no retraining).
     _maybe_apply_cloth_lora(
@@ -218,7 +331,8 @@ def generate_tryon_image(
     steps = int(max(4, min(config.num_inference_steps, 30)))
     guidance = float(config.guidance_scale)
     if mode == "lcm":
-        guidance = float(np.clip(guidance, 0.5, 2.0))
+        # v16.11b: LCM needs guidance ~4-7 for detail. 2.0 was too low → flat output.
+        guidance = float(np.clip(guidance, 1.0, 7.5))
         steps = int(max(4, min(steps, 14)))
     elif mode == "hypersd":
         guidance = float(np.clip(guidance, 1.5, 5.0))
@@ -227,7 +341,7 @@ def generate_tryon_image(
         guidance = float(np.clip(guidance, 1.0, 7.5))
         steps = int(max(8, min(steps, 30)))
 
-    output = pipe(
+    call_kwargs = dict(
         prompt=_build_prompt(user_prompt),
         negative_prompt=config.negative_prompt,
         image=init_image,
@@ -236,11 +350,73 @@ def generate_tryon_image(
         height=infer_h,
         num_inference_steps=steps,
         guidance_scale=guidance,
-        strength=float(np.clip(config.strength, 0.15, 0.5)),
-    ).images[0]
-    output_np = np.array(output)
+        strength=float(np.clip(config.strength, 0.15, 0.90)),
+    )
 
+    # v16.10: fp32 pipeline — no NaN guard needed. Run directly.
+    result = pipe(**call_kwargs)
+    output = result.images[0]
+
+    # Convert PIL → numpy with NaN safety
+    output_np = np.array(output, dtype=np.float32)
+    _raw_max = float(np.nanmax(output_np))
+    _raw_min = float(np.nanmin(output_np))
+    _raw_mean = float(np.nanmean(output_np))
+    _nan_count = int(np.isnan(np.array(output, dtype=np.float32)).sum())
+    print(f"[gen_tryon] Raw output: shape={output_np.shape}, min={_raw_min:.2f}, max={_raw_max:.2f}, mean={_raw_mean:.2f}, NaN={_nan_count}")
+
+    # Handle NaN
+    output_np = np.nan_to_num(output_np, nan=128.0, posinf=255.0, neginf=0.0)
+
+    if _raw_max <= 1.5 and _raw_max > 0.01:
+        # Float [0,1] range
+        output_np = np.clip(output_np, 0.0, 1.0) * 255.0
+    elif _raw_max <= 0.01:
+        # Nearly all zeros — diffusion failed
+        print(f"[gen_tryon] Diffusion produced near-zero output, returning input")
+        return init_tryon_rgb.copy()
+
+    output_np = np.clip(output_np, 0, 255).astype(np.uint8)
+
+    # v16.7f: Resize to target FIRST — diffusion may output different size (e.g. 256x256)
     if output_np.shape[:2] != (target_h, target_w):
-        output_np = np.array(output.resize((target_w, target_h), Image.BILINEAR))
+        output_np = cv2.resize(output_np, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+
+    # Check if output is mostly black (NaN → 0 artifact)
+    _mean_brightness = float(output_np.mean())
+    if _mean_brightness < 5:
+        print(f"[gen_tryon] WARNING: diffusion output nearly black (mean={_mean_brightness:.1f}), blending with input")
+        output_np = (
+            output_np.astype(np.float32) * 0.5
+            + init_tryon_rgb.astype(np.float32) * 0.5
+        )
+        output_np = np.clip(output_np, 0, 255).astype(np.uint8)
+
+    # v16.11: Simple mask-based composite — diffusion inside mask, init outside.
+    # No sleeve-specific attenuation here; app.py handles sleeve preservation if needed.
+    if inpaint_mask_gray.shape[:2] != (target_h, target_w):
+        safe_mask = cv2.resize(inpaint_mask_gray, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+    else:
+        safe_mask = inpaint_mask_gray.copy()
+
+    # v16.26: For DRESS, use HARD replace (no edge blur) so the diffusion output
+    # fully replaces the init inside the mask. The previous soft alpha (3px
+    # dilate + 5x5 blur) caused a semi-transparent boundary where init pixels
+    # (warped dress + skin fill) bled through, producing the "two-layer" look.
+    # For top, keep the soft edge so sleeves blend naturally into skin.
+    # v16.38: Unified soft alpha for ALL categories (mirrors shirt path).
+    # The previous dress-only hard binary mask produced visible 'stamp'
+    # seams. Soft 5x5 blur blends the diffusion output into surrounding
+    # skin/background naturally.
+    safe_mask = cv2.dilate(safe_mask, np.ones((3, 3), np.uint8), iterations=1)
+    safe_mask = cv2.GaussianBlur(safe_mask, (5, 5), 0)
+    safe_alpha = (safe_mask.astype(np.float32) / 255.0)[..., None]
+
+    output_np = (
+        output_np.astype(np.float32) * safe_alpha
+        + init_tryon_rgb.astype(np.float32) * (1.0 - safe_alpha)
+    )
+    output_np = np.nan_to_num(output_np, nan=0.0, posinf=255.0, neginf=0.0)
+    output_np = np.clip(output_np, 0, 255).astype(np.uint8)
 
     return output_np
