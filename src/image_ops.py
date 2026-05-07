@@ -214,10 +214,15 @@ def build_cloth_mask(cloth_rgb: np.ndarray, threshold: int = 245) -> np.ndarray:
     mask = cv2.morphologyEx(init_mask, cv2.MORPH_OPEN, kernel, iterations=1)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
 
-    # Dilate mask outward so cloth covers full silhouette (prevents waist pinch).
-    # Keep dilation moderate (5×5) to avoid pulling in white background pixels.
-    dilate_k = np.ones((5, 5), np.uint8)
+    # Dilate mask outward so cloth covers full silhouette.
+    # Use moderate dilation to extend coverage for sleeve edges without
+    # pulling in excessive background.
+    dilate_k = np.ones((7, 7), np.uint8)
     mask = cv2.dilate(mask, dilate_k, iterations=1)
+    # Fill internal holes via contour-fill
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        cv2.drawContours(mask, contours, -1, 255, thickness=cv2.FILLED)
     return mask
 
 
@@ -252,9 +257,11 @@ def warp_cloth_to_torso(
     shoulder_width = np.linalg.norm(np.array(box.left_shoulder) - np.array(box.right_shoulder))
     hip_width = np.linalg.norm(np.array(box.left_hip) - np.array(box.right_hip))
 
-    # Body-conforming: separate widths for shoulders and hips
-    top_half_w = int(shoulder_width * fit_scale / 2)
-    bot_half_w = int(hip_width * fit_scale / 2)
+    # Garment must be WIDER than skeleton — clothes hang loose
+    # Add ~15% overhang beyond body edges for natural look
+    scale = float(np.clip(fit_scale, 0.90, 1.25))
+    top_half_w = int(shoulder_width * scale * 0.62)   # was /2 (0.50) → too tight
+    bot_half_w = int(hip_width * scale * 0.62)
 
     torso_height = int(np.mean([
         abs(box.left_hip[1] - box.left_shoulder[1]),
@@ -286,11 +293,15 @@ def warp_cloth_to_torso(
     ])
 
     transform = cv2.getPerspectiveTransform(src, dst)
-    # Pre-multiply cloth by mask to prevent white background bleeding
-    mask_f = (cloth_mask.astype(np.float32) / 255.0)[..., None]
-    cloth_premul = (cloth_rgb.astype(np.float32) * mask_f).clip(0, 255).astype(np.uint8)
-    warped_cloth = cv2.warpPerspective(cloth_premul, transform, (width, height), flags=cv2.INTER_LINEAR)
-    warped_mask = cv2.warpPerspective(cloth_mask, transform, (width, height), flags=cv2.INTER_LINEAR)
+    # Use BORDER_REPLICATE for cloth (no black edges), BORDER_CONSTANT for mask
+    warped_cloth = cv2.warpPerspective(
+        cloth_rgb, transform, (width, height),
+        flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE,
+    )
+    warped_mask = cv2.warpPerspective(
+        cloth_mask, transform, (width, height),
+        flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+    )
 
     return warped_cloth, warped_mask
 
@@ -300,36 +311,45 @@ def erase_clothing_region(
     erase_mask: np.ndarray,
     parsing_skin_mask: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Remove original clothing by inpainting the masked area.
+    """Remove original clothing — direct inpaint strategy.
 
-    Only the garment pixels (upper_clothes from parsing) should be in
-    erase_mask.  Skin / neck / torso must NOT be included.
+    KEY FIX v3: Previous two-zone strategy (core fill + edge inpaint)
+    created a visible flat beige patch at torso center.
 
-    If a skin mask is provided, sample real skin texture to seed the
-    inpainter with a plausible base rather than flat colour.
+    New approach: Use Telea inpainting on the ENTIRE erase area directly.
+    Since we've already tightened the erase_mask to only cover actual
+    clothing pixels (not skin), the inpaint area is small enough for
+    Telea to produce natural results without smearing.
+
+    For very large erase areas (>15% of image), fall back to a
+    shrink-then-inpaint approach to avoid Telea artifacts.
     """
     h, w = person_rgb.shape[:2]
-
-    # Tight binary mask – small dilation to catch garment edge remnants
     binary = (erase_mask > 30).astype(np.uint8) * 255
-    kernel = np.ones((5, 5), np.uint8)
-    binary = cv2.dilate(binary, kernel, iterations=1)
 
-    # Pre-fill the erase region with plausible skin.
-    prefilled = person_rgb.copy()
-    if parsing_skin_mask is not None:
-        skin_area = parsing_skin_mask > 0
-        if skin_area.sum() > 200:
-            mean_skin = prefilled[skin_area].mean(axis=0).astype(np.uint8)
-            erase_area = binary > 0
-            prefilled[erase_area] = mean_skin
+    erase_pixels = int(binary.sum()) // 255
+    total_pixels = h * w
 
-    # Navier-Stokes inpainting with tighter radius for realistic skin
-    inpainted = cv2.inpaint(
-        cv2.cvtColor(prefilled, cv2.COLOR_RGB2BGR),
-        binary, inpaintRadius=6, flags=cv2.INPAINT_NS,
-    )
-    return cv2.cvtColor(inpainted, cv2.COLOR_BGR2RGB)
+    if erase_pixels < 100:
+        return person_rgb.copy()
+
+    result_bgr = cv2.cvtColor(person_rgb, cv2.COLOR_RGB2BGR)
+
+    if erase_pixels < total_pixels * 0.15:
+        # Small area: direct Telea inpaint (natural, uses surrounding pixels)
+        result_bgr = cv2.inpaint(result_bgr, binary, inpaintRadius=5, flags=cv2.INPAINT_TELEA)
+    else:
+        # Large area: shrink inpaint in layers (outside-in) to avoid smear
+        # Layer 1: inpaint outer ring (edge band)
+        k = np.ones((11, 11), np.uint8)
+        inner = cv2.erode(binary, k, iterations=2)
+        outer_ring = cv2.subtract(binary, inner)
+        result_bgr = cv2.inpaint(result_bgr, outer_ring, inpaintRadius=5, flags=cv2.INPAINT_TELEA)
+        # Layer 2: inpaint remaining inner core (now surrounded by inpainted pixels)
+        if inner.sum() > 255 * 50:
+            result_bgr = cv2.inpaint(result_bgr, inner, inpaintRadius=6, flags=cv2.INPAINT_TELEA)
+
+    return cv2.cvtColor(result_bgr, cv2.COLOR_BGR2RGB)
 
 
 def poisson_blend(
@@ -338,29 +358,45 @@ def poisson_blend(
     warped_mask: np.ndarray,
 ) -> np.ndarray:
     """Poisson seamless clone — merges garment colours/gradients naturally."""
-    binary = (warped_mask > 30).astype(np.uint8) * 255
-    kernel = np.ones((5, 5), np.uint8)
-    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
+    full_mask = (warped_mask > 20).astype(np.uint8) * 255
+    full_mask = cv2.morphologyEx(full_mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=2)
 
-    # Compute centre of the mask
-    ys, xs = np.where(binary > 0)
+    # Clone only a conservative core region; keep outer boundary for alpha blend.
+    core_mask = cv2.erode(
+        full_mask,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
+        iterations=1,
+    )
+
+    # Compute centre of the core mask
+    ys, xs = np.where(core_mask > 0)
     if len(xs) < 100:
-        return person_rgb  # nothing to blend
+        return blend_tryon(person_rgb, warped_cloth, warped_mask, alpha=0.92)
     cx, cy = int(xs.mean()), int(ys.mean())
 
     # seamlessClone requires BGR
     try:
-        result = cv2.seamlessClone(
+        core_clone = cv2.seamlessClone(
             cv2.cvtColor(warped_cloth, cv2.COLOR_RGB2BGR),
             cv2.cvtColor(person_rgb, cv2.COLOR_RGB2BGR),
-            binary,
+            core_mask,
             (cx, cy),
-            cv2.MIXED_CLONE,
+            cv2.NORMAL_CLONE,
         )
-        return cv2.cvtColor(result, cv2.COLOR_BGR2RGB)
+
+        core_clone_rgb = cv2.cvtColor(core_clone, cv2.COLOR_BGR2RGB)
+
+        # Feathered merge from Poisson-core to original around edges.
+        core_alpha = cv2.GaussianBlur(core_mask.astype(np.float32), (21, 21), 0) / 255.0
+        core_alpha = core_alpha[..., None]
+        blended = (
+            core_clone_rgb.astype(np.float32) * core_alpha
+            + person_rgb.astype(np.float32) * (1.0 - core_alpha)
+        )
+        return np.clip(blended, 0, 255).astype(np.uint8)
     except cv2.error:
         # Fallback to alpha blend when mask is near image border
-        return blend_tryon(person_rgb, warped_cloth, warped_mask, alpha=0.95)
+        return blend_tryon(person_rgb, warped_cloth, warped_mask, alpha=0.92)
 
 
 def refine_with_optical_flow(
@@ -480,6 +516,42 @@ def compute_body_measurements(
     }
 
 
+def compute_leg_measurements(
+    pose: dict[str, tuple[int, int]],
+) -> dict[str, float]:
+    """Compute leg dimensions from pose landmarks.
+
+    v16.11c: Added for pants support.
+
+    Returns:
+      - 'hip_width': distance between left/right hips
+      - 'leg_length': average length from hip to ankle
+      - 'knee_width': average distance between knees (if available)
+    """
+    lh = np.array(pose.get("left_hip", (0, 0)), dtype=np.float64)
+    rh = np.array(pose.get("right_hip", (0, 0)), dtype=np.float64)
+    lk = np.array(pose.get("left_knee", (0, 0)), dtype=np.float64)
+    rk = np.array(pose.get("right_knee", (0, 0)), dtype=np.float64)
+    la = np.array(pose.get("left_ankle", (0, 0)), dtype=np.float64)
+    ra = np.array(pose.get("right_ankle", (0, 0)), dtype=np.float64)
+
+    hip_w = float(np.linalg.norm(lh - rh))
+
+    # Leg length: hip to ankle
+    left_leg_len = float(np.linalg.norm(lh - la)) if la[1] > 0 else float(np.linalg.norm(lh - lk))
+    right_leg_len = float(np.linalg.norm(rh - ra)) if ra[1] > 0 else float(np.linalg.norm(rh - rk))
+    leg_len = np.mean([left_leg_len, right_leg_len]) if left_leg_len > 0 and right_leg_len > 0 else max(left_leg_len, right_leg_len)
+
+    # Knee width (optional)
+    knee_w = float(np.linalg.norm(lk - rk)) if lk[1] > 0 and rk[1] > 0 else hip_w * 0.95
+
+    return {
+        "hip_width": hip_w,
+        "leg_length": leg_len,
+        "knee_width": knee_w,
+    }
+
+
 def build_skeleton_erase_mask(
     pose: dict[str, tuple[int, int]],
     image_shape: tuple[int, int],
@@ -501,11 +573,13 @@ def build_skeleton_erase_mask(
     hw = float(np.linalg.norm(lh - rh))
     torso_h = float(np.mean([abs(lh[1] - ls[1]), abs(rh[1] - rs[1])]))
 
-    # Generous coverage: extend above shoulders and below hips
-    top_y = int(min(ls[1], rs[1]) - 0.15 * torso_h)
-    bot_y = int(max(lh[1], rh[1]) + 0.10 * torso_h)
+    # Conservative coverage: small extension above shoulders (just for collar),
+    # moderate extension below hips.
+    # Previous bug: 0.15 * torso_h above shoulders was too much → white V at neckline
+    top_y = int(min(ls[1], rs[1]) - 0.05 * torso_h)   # was 0.15 → too aggressive
+    bot_y = int(max(lh[1], rh[1]) + 0.08 * torso_h)
     cx = int((ls[0] + rs[0] + lh[0] + rh[0]) / 4)
-    half_w = int(max(sw, hw) * 0.72)  # wide enough for sleeves
+    half_w = int(max(sw, hw) * 0.68)  # was 0.72 → slightly tighter to avoid over-erase
 
     top_y = max(0, top_y)
     bot_y = min(h - 1, bot_y)
@@ -515,8 +589,8 @@ def build_skeleton_erase_mask(
     mask = np.zeros((h, w), dtype=np.uint8)
     cv2.rectangle(mask, (lx, top_y), (rx, bot_y), 255, thickness=-1)
 
-    # Add shoulder circles for sleeve coverage
-    sleeve_r = max(12, int(0.30 * sw))
+    # Add shoulder circles for sleeve coverage (smaller to avoid over-erase)
+    sleeve_r = max(8, int(0.20 * sw))   # was 0.30 → too big, erased too much skin
     cv2.circle(mask, (int(ls[0]), int(ls[1])), sleeve_r, 255, thickness=-1)
     cv2.circle(mask, (int(rs[0]), int(rs[1])), sleeve_r, 255, thickness=-1)
 
@@ -548,51 +622,111 @@ def prefit_scale_cloth(
     cloth_rgb: np.ndarray,
     cloth_mask: np.ndarray,
     measurements: dict[str, float],
-    preserve_ratio: float = 0.90,
+    preserve_ratio: float = 0.88,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Pre-scale cloth with Garment Shape Constraint (CP-VTON / HR-VITON).
+    """Pre-scale cloth to match person's body — garment-preserve approach.
 
-    Scales by max(shoulder, hip) width so garment is never narrower than
-    the body.  ``preserve_ratio`` ensures the garment keeps at least 90%
-    of its original width — prevents TPS from over-squeezing.
+    Two-axis scaling:
+    1. WIDTH: scale garment TORSO width to person shoulder * loose_factor
+       Uses CORE torso width (not including sleeves) for accurate ratio.
+    2. HEIGHT: ensure garment covers full torso height (collar→hip+margin)
+
+    Garment type classification (tight/normal/loose) adjusts the width factor
+    so loose garments aren't squeezed onto slim bodies.
     """
     ys, xs = np.where(cloth_mask > 0)
     if len(xs) < 50:
         return cloth_rgb, cloth_mask
 
-    cloth_w = float(xs.max() - xs.min())
-    cloth_h = float(ys.max() - ys.min())
-    if cloth_w < 10 or cloth_h < 10:
+    y1, y2 = int(ys.min()), int(ys.max())
+    x1, x2 = int(xs.min()), int(xs.max())
+    cloth_h = max(1, y2 - y1)
+    cloth_w = max(1, x2 - x1)
+    if cloth_h < 10:
         return cloth_rgb, cloth_mask
 
+    h_mask = cloth_mask.shape[0]
+
+    def _row_width(rel_y: float) -> float:
+        row = max(0, min(h_mask - 1, y1 + int(cloth_h * rel_y)))
+        nz = np.where(cloth_mask[row] > 0)[0]
+        return float(nz.max() - nz.min()) if len(nz) > 4 else 0.0
+
+    # ── Measure CORE torso width (excluding sleeves) ──
+    # Use minimum width in the 40%-65% band — this is the true torso
+    # body. At shoulder level (12%), sleeves inflate the width → wrong ratio.
+    core_widths = []
+    for frac in [0.40, 0.45, 0.50, 0.55, 0.60, 0.65]:
+        w = _row_width(frac)
+        if w > 0:
+            core_widths.append(w)
+
+    # Also get shoulder-level width for comparison
+    w_shoulder = _row_width(0.12)
+
+    if not core_widths or w_shoulder < 10:
+        return cloth_rgb, cloth_mask
+
+    cloth_torso_w = min(core_widths)  # true torso width, no sleeves
+
+    # If shoulder is much wider than core (sleeves present), use CORE for ratio.
+    # Otherwise use shoulder width (sleeveless/tank top).
+    if w_shoulder > cloth_torso_w * 1.15:
+        # Sleeves present — use core torso for accurate width matching
+        cloth_ref_w = cloth_torso_w
+    else:
+        # No significant sleeves — use shoulder width directly
+        cloth_ref_w = w_shoulder
+
+    if cloth_ref_w < 10:
+        return cloth_rgb, cloth_mask
+
+    # ── Measure cloth width at mid-torso (~55%) ──
+    cloth_mid_w = _row_width(0.55) if _row_width(0.55) > 0 else cloth_ref_w
+
+    # ── Classify garment type ──
+    aspect_ratio = cloth_w / max(1, cloth_h)
+    shoulder_to_mid = w_shoulder / max(1, cloth_mid_w)
+
+    if aspect_ratio > 1.2 or shoulder_to_mid > 1.25:
+        loose_factor = 1.25  # Loose/oversized garment
+    elif aspect_ratio > 0.85:
+        loose_factor = 1.15  # Normal fit
+    else:
+        loose_factor = 1.08  # Slim/fitted garment
+
     person_sw = measurements["shoulder_width"]
-    person_hw = measurements["hip_width"]
-    body_width = max(person_sw, person_hw)
+    person_torso_h = measurements["torso_height"]
 
-    # Garment Shape Constraint: target width is at least
-    #   max(body_width * 1.12, cloth_width * preserve_ratio)
-    # This prevents the garment from being squeezed smaller than its
-    # natural shape while still fitting the body.
-    target_w = max(body_width * 1.12, cloth_w * preserve_ratio)
-    # Height constraint: also preserve at least preserve_ratio of original cloth
-    # height so long-sleeve shirts are not compressed into crop-top / bra shapes.
-    target_h = max(measurements["torso_height"] * 1.25, cloth_h * preserve_ratio)
+    # ── WIDTH scale: person_shoulder * loose_factor / cloth_torso_width ──
+    # Using core torso width prevents sleeves from deflating the scale ratio.
+    # Add 5% oversize to prevent garment looking too small on body.
+    sx = (person_sw * loose_factor * 1.05) / cloth_ref_w
 
-    sx = target_w / cloth_w
+    # ── HEIGHT scale: ensure garment covers full torso + 10% margin ──
+    target_h = person_torso_h * 1.10
     sy = target_h / cloth_h
-    sx = np.clip(sx, 0.6, 2.5)
-    sy = np.clip(sy, 0.6, 2.5)
+
+    # PRIMARY: use width-based scale (preserves garment proportions).
+    # Only apply separate height scale if garment would be too SHORT with uniform sx.
+    sx_final = sx
+    sy_final = sx  # uniform scale by default (preserves aspect ratio)
+
+    # If uniform scale leaves garment too short for torso, stretch height slightly
+    if sy > sx * 1.05:
+        # Garment is shorter than torso at this width scale — add height
+        # But cap the stretch to avoid significant distortion (max 15% non-uniform)
+        sy_final = min(sy, sx * 1.15)
+
+    # Clamp: don't shrink below 85% or grow beyond 2.5x
+    sx_final = float(np.clip(sx_final, 0.85, 2.5))
+    sy_final = float(np.clip(sy_final, 0.85, 2.5))
 
     h, w = cloth_rgb.shape[:2]
-    new_w, new_h = max(10, int(w * sx)), max(10, int(h * sy))
+    new_w, new_h = max(10, int(w * sx_final)), max(10, int(h * sy_final))
 
     scaled_rgb = cv2.resize(cloth_rgb, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
     scaled_mask = cv2.resize(cloth_mask, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-
-    # Dilate mask slightly to prevent tight-cropping that causes
-    # TPS to squeeze chest/waist.
-    dilate_k = np.ones((11, 11), np.uint8)
-    scaled_mask = cv2.dilate(scaled_mask, dilate_k, iterations=1)
 
     return scaled_rgb, scaled_mask
 
@@ -621,6 +755,11 @@ def segment_cloth_u2net(cloth_rgb: np.ndarray) -> np.ndarray:
         k = np.ones((3, 3), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=2)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k, iterations=1)
+        # Fill internal holes: find contours and fill so sleeve interior
+        # is not lost due to U2Net under-segmenting thin arm areas.
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            cv2.drawContours(mask, contours, -1, 255, thickness=cv2.FILLED)
         return mask
     except BaseException:
         # Catch SystemExit from rembg when onnxruntime is missing
