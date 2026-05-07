@@ -72,10 +72,9 @@ def _safe_header(val: str) -> str:
             pass
     # Collapse multiple spaces and strip leading/trailing whitespace
     result = re.sub(r" +", " ", "".join(cleaned)).strip()
-    # h11 rejects empty or trailing-space header values
-    # Keep enough room for late pipeline stages such as DressCoreLock,
-    # DrapeLightPass, DressGen, and Diffusion[GPU]. 200 chars hid those tags
-    # in the React UI, making successful GPU passes look like they never ran.
+    # h11 rejects empty or trailing-space header values. Keep enough room for
+    # late pipeline tags such as DressFullErase/DressFullGenMask/Diffusion so
+    # the UI can confirm which generation path actually ran.
     result = result[:1000].strip()
     if not result:
         return "ok"
@@ -114,8 +113,8 @@ async def api_tryon(
     gen_steps: int = Form(20),
     gen_guidance: float = Form(2.5),
     preserve_strength: float = Form(0.90),
-    quality_preset: str = Form("hq"),
-    refiner_mode: str = Form("lcm"),
+    quality_preset: str = Form("balanced"),
+    refiner_mode: str = Form("dpm++"),
     cloth_type: str = Form("auto"),
     use_catvton_cloud: bool = Form(True),
 ):
@@ -129,6 +128,10 @@ async def api_tryon(
     except ValueError as exc:
         return JSONResponse(status_code=400, content={"error": str(exc)})
 
+    # Keep the public API on AI refinement. Older built frontends may still send
+    # use_gen=false from the removed CPU-only button; treat that as Local SD.
+    effective_use_gen = True
+
     try:
         loop = asyncio.get_event_loop()
         output, info = await asyncio.wait_for(
@@ -140,7 +143,7 @@ async def api_tryon(
                     fit_scale=fit_scale,
                     alpha=alpha,
                     y_offset=y_offset,
-                    use_gen=use_gen,
+                    use_gen=effective_use_gen,
                     style_prompt=style_prompt,
                     gen_steps=gen_steps,
                     gen_guidance=gen_guidance,
@@ -207,8 +210,14 @@ if DIST_DIR.is_dir():
             return JSONResponse(status_code=404, content={"error": "Not found"})
         file_path = DIST_DIR / full_path
         if full_path and file_path.is_file():
-            return FileResponse(str(file_path))
-        return FileResponse(str(DIST_DIR / "index.html"))
+            headers = {}
+            if file_path.name == "index.html":
+                headers["Cache-Control"] = "no-store"
+            return FileResponse(str(file_path), headers=headers)
+        return FileResponse(
+            str(DIST_DIR / "index.html"),
+            headers={"Cache-Control": "no-store"},
+        )
 
 
 if __name__ == "__main__":

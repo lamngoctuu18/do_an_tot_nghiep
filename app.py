@@ -36,7 +36,7 @@ from src.human_parsing import (
     get_pants_mask,
     get_skin_mask,
 )
-from src.tps_warp import tps_warp_cloth, warp_sleeves_to_arms, classify_garment_type, simple_affine_warp_cloth, body_fit_warp_dress, detect_garment_category, detect_pants_landmarks, detect_pants_type
+from src.tps_warp import tps_warp_cloth, warp_sleeves_to_arms, classify_garment_type, simple_affine_warp_cloth, detect_garment_category, detect_pants_landmarks, detect_pants_type
 from src.gen_tryon import GenConfig, generate_tryon_image
 from src.cloud_vton_router import CloudVTONUnavailableError, generate_with_cloud_router
 from src.storage import resolve_storage_config
@@ -150,6 +150,139 @@ def _apply_color_consistency(
         blended[..., channel][mask] = np.clip(blended_vals, 0, 255)
 
     return cv2.cvtColor(_safe_uint8(blended), cv2.COLOR_LAB2RGB)
+
+
+def _build_dress_diffusion_seed(
+    init_tryon_rgb: np.ndarray,
+    gen_mask: np.ndarray,
+    garment_mask: np.ndarray,
+) -> np.ndarray:
+    """Soften the CPU dress guide before inpainting.
+
+    Passing the sharp warped dress directly to SD-inpaint makes LCM reconstruct
+    that CPU composite almost exactly.  Keep the coarse color/print placement,
+    but remove high-frequency pasted pixels so diffusion has room to redraw
+    fabric folds and sleeve structure.
+    """
+    gen_mask = _fit_like(gen_mask, init_tryon_rgb, is_mask=True)
+    garment_mask = _fit_like(garment_mask, init_tryon_rgb, is_mask=True)
+    active = gen_mask > 20
+    if int(active.sum()) < 500:
+        return init_tryon_rgb
+
+    soft_alpha = cv2.GaussianBlur(active.astype(np.float32), (11, 11), 2.6)
+    soft_alpha = np.clip(soft_alpha * 0.84, 0.0, 0.84)[..., None]
+
+    init_lab = cv2.cvtColor(init_tryon_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    guide_lab = init_lab.copy()
+    light_low = cv2.GaussianBlur(init_lab[:, :, 0], (0, 0), 4.2)
+    chroma_a = cv2.GaussianBlur(init_lab[:, :, 1], (0, 0), 1.6)
+    chroma_b = cv2.GaussianBlur(init_lab[:, :, 2], (0, 0), 1.6)
+    guide_lab[:, :, 0] = init_lab[:, :, 0] * 0.40 + light_low * 0.60
+    guide_lab[:, :, 1] = init_lab[:, :, 1] * 0.72 + chroma_a * 0.28
+    guide_lab[:, :, 2] = init_lab[:, :, 2] * 0.72 + chroma_b * 0.28
+    guide = cv2.cvtColor(_safe_uint8(guide_lab), cv2.COLOR_LAB2RGB).astype(np.float32)
+
+    garment_active = (garment_mask > 20) & active
+    if int(garment_active.sum()) > 200:
+        median_rgb = np.median(init_tryon_rgb[garment_active], axis=0).astype(np.float32)
+        guide[active] = guide[active] * 0.92 + median_rgb * 0.08
+
+        ys, xs = np.where(garment_active)
+        y1, y2 = int(ys.min()), int(ys.max())
+        x1, x2 = int(xs.min()), int(xs.max())
+        height = max(1, y2 - y1)
+        width = max(1, x2 - x1)
+        yy, xx = np.indices(garment_mask.shape[:2], dtype=np.float32)
+        xn = (xx - (x1 + x2) * 0.5) / max(1.0, width * 0.5)
+        yn = (yy - y1) / max(1.0, float(height))
+        vertical_folds = np.sin((xn * 4.8 + yn * 1.1) * np.pi) * 11.0
+        side_shadow = -15.0 * np.exp(-((np.abs(xn) - 0.76) ** 2) / 0.050)
+        waist_shadow = -10.0 * np.exp(-((yn - 0.42) ** 2) / 0.018) * np.exp(-(xn ** 2) / 0.65)
+        center_highlight = 7.0 * np.exp(-(xn ** 2) / 0.18) * np.clip((yn - 0.18) / 0.52, 0.0, 1.0)
+        fold_delta = cv2.GaussianBlur(
+            (vertical_folds + side_shadow + waist_shadow + center_highlight).astype(np.float32),
+            (0, 0),
+            2.6,
+        )
+
+        lab = cv2.cvtColor(_safe_uint8(guide), cv2.COLOR_RGB2LAB).astype(np.float32)
+        fold_mask = cv2.GaussianBlur(garment_active.astype(np.float32), (17, 17), 5.0)
+        lab[:, :, 0] = np.clip(lab[:, :, 0] + fold_delta * fold_mask, 0, 255)
+        guide = cv2.cvtColor(_safe_uint8(lab), cv2.COLOR_LAB2RGB).astype(np.float32)
+
+    seed = (
+        init_tryon_rgb.astype(np.float32) * (1.0 - soft_alpha)
+        + guide.astype(np.float32) * soft_alpha
+    )
+    return _safe_uint8(seed)
+
+
+def _restore_dress_print_detail(
+    generated_rgb: np.ndarray,
+    reference_rgb: np.ndarray,
+    garment_mask: np.ndarray,
+    detail_strength: float = 0.55,
+) -> np.ndarray:
+    """Put source print detail back without flattening diffusion lighting."""
+    reference_rgb = _fit_like(reference_rgb, generated_rgb, is_mask=False)
+    garment_mask = _fit_like(garment_mask, generated_rgb, is_mask=True)
+    mask = garment_mask > 20
+    if int(mask.sum()) < 500:
+        return generated_rgb
+
+    mask_core = cv2.erode(mask.astype(np.uint8) * 255, np.ones((3, 3), np.uint8), iterations=1)
+    mask_f = cv2.GaussianBlur((mask_core > 20).astype(np.float32), (9, 9), 2.2)
+    mask_f = np.clip(mask_f * float(np.clip(detail_strength, 0.0, 1.0)), 0.0, 1.0)
+
+    gen_lab = cv2.cvtColor(generated_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    ref_lab = cv2.cvtColor(reference_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+
+    ref_l = ref_lab[:, :, 0]
+    gen_l = gen_lab[:, :, 0]
+    ref_detail = ref_l - cv2.GaussianBlur(ref_l, (0, 0), 2.4)
+    ref_detail = np.clip(ref_detail, -38.0, 38.0)
+    gen_lab[:, :, 0] = np.clip(gen_l + ref_detail * mask_f, 0, 255)
+
+    chroma_alpha = np.clip(mask_f * 0.72, 0.0, 0.72)
+    gen_lab[:, :, 1] = gen_lab[:, :, 1] * (1.0 - chroma_alpha) + ref_lab[:, :, 1] * chroma_alpha
+    gen_lab[:, :, 2] = gen_lab[:, :, 2] * (1.0 - chroma_alpha) + ref_lab[:, :, 2] * chroma_alpha
+    return cv2.cvtColor(_safe_uint8(gen_lab), cv2.COLOR_LAB2RGB)
+
+
+def _restore_dress_crisp_source_texture(
+    refined_rgb: np.ndarray,
+    source_rgb: np.ndarray,
+    garment_mask: np.ndarray,
+    detail_strength: float = 0.88,
+    chroma_strength: float = 0.90,
+) -> np.ndarray:
+    """Restore sharp source print while keeping refined broad lighting."""
+    source_rgb = _fit_like(source_rgb, refined_rgb, is_mask=False)
+    garment_mask = _fit_like(garment_mask, refined_rgb, is_mask=True)
+    mask = garment_mask > 20
+    if int(mask.sum()) < 500:
+        return refined_rgb
+
+    core = cv2.erode(mask.astype(np.uint8) * 255, np.ones((3, 3), np.uint8), iterations=1)
+    mask_f = cv2.GaussianBlur((core > 20).astype(np.float32), (5, 5), 1.1)
+    mask_f = np.clip(mask_f * float(np.clip(detail_strength, 0.0, 1.0)), 0.0, 1.0)
+
+    refined_lab = cv2.cvtColor(refined_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    source_lab = cv2.cvtColor(source_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+
+    refined_l = refined_lab[:, :, 0]
+    source_l = source_lab[:, :, 0]
+    refined_low = cv2.GaussianBlur(refined_l, (0, 0), 7.0)
+    source_low = cv2.GaussianBlur(source_l, (0, 0), 7.0)
+    source_detail = np.clip(source_l - source_low, -58.0, 58.0)
+    crisp_l = np.clip(refined_low + source_detail, 0, 255)
+
+    refined_lab[:, :, 0] = refined_l * (1.0 - mask_f) + crisp_l * mask_f
+    chroma_alpha = np.clip(mask_f * float(np.clip(chroma_strength, 0.0, 1.0)), 0.0, 1.0)
+    refined_lab[:, :, 1] = refined_lab[:, :, 1] * (1.0 - chroma_alpha) + source_lab[:, :, 1] * chroma_alpha
+    refined_lab[:, :, 2] = refined_lab[:, :, 2] * (1.0 - chroma_alpha) + source_lab[:, :, 2] * chroma_alpha
+    return cv2.cvtColor(_safe_uint8(refined_lab), cv2.COLOR_LAB2RGB)
 
 
 def _restore_core_garment(
@@ -295,6 +428,83 @@ def _build_sleeve_protect_mask(
     if int(protect.sum()) < 255 * 40:
         return None
     return protect
+
+
+def _build_arm_pose_envelope(
+    image_shape: tuple[int, int],
+    pose: dict[str, tuple[int, int]] | None,
+    parsing: dict[str, np.ndarray] | None,
+    side: str,
+) -> np.ndarray | None:
+    """Build a tight sleeve-allowed area from the model arm pose."""
+    if pose is None:
+        return None
+
+    h, w = image_shape
+    sh = pose.get(f"{side}_shoulder")
+    el = pose.get(f"{side}_elbow")
+    wr = pose.get(f"{side}_wrist")
+    ls = pose.get("left_shoulder")
+    rs = pose.get("right_shoulder")
+    if sh is None or el is None or ls is None or rs is None:
+        return None
+
+    sh_p = tuple(map(int, sh))
+    el_p = tuple(map(int, el))
+    wr_p = tuple(map(int, wr if wr is not None else el))
+    sw = max(20.0, float(np.linalg.norm(np.array(ls, dtype=np.float32) - np.array(rs, dtype=np.float32))))
+    upper_r = max(5, int(sw * 0.13))
+    lower_r = max(4, int(sw * 0.105))
+
+    env = np.zeros((h, w), dtype=np.uint8)
+    cv2.line(env, sh_p, el_p, 255, thickness=upper_r * 2, lineType=cv2.LINE_AA)
+    cv2.line(env, el_p, wr_p, 255, thickness=lower_r * 2, lineType=cv2.LINE_AA)
+    cv2.circle(env, sh_p, int(upper_r * 1.15), 255, thickness=-1, lineType=cv2.LINE_AA)
+    cv2.circle(env, el_p, upper_r, 255, thickness=-1, lineType=cv2.LINE_AA)
+    cv2.circle(env, wr_p, lower_r, 255, thickness=-1, lineType=cv2.LINE_AA)
+
+    if parsing:
+        arm_region = parsing.get(f"{side}_arm")
+        if arm_region is not None:
+            arm_u8 = (_fit_like(arm_region, env, is_mask=True) > 20).astype(np.uint8) * 255
+            k = (max(5, int(sw * 0.11)) | 1)
+            arm_u8 = cv2.dilate(
+                arm_u8,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)),
+                iterations=1,
+            )
+            env = cv2.bitwise_or(env, arm_u8)
+
+    top_limit = max(0, int(sh_p[1] - sw * 0.18))
+    env[:top_limit, :] = 0
+    env = cv2.morphologyEx(env, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=1)
+    return env
+
+
+def _clip_sleeve_to_arm_pose(
+    sleeve_rgb: np.ndarray,
+    sleeve_mask_f: np.ndarray,
+    pose: dict[str, tuple[int, int]] | None,
+    parsing: dict[str, np.ndarray] | None,
+    side: str,
+) -> tuple[np.ndarray, np.ndarray, bool]:
+    """Constrain a warped long sleeve to the model arm size and direction."""
+    envelope = _build_arm_pose_envelope(sleeve_mask_f.shape[:2], pose, parsing, side)
+    if envelope is None:
+        return sleeve_rgb, sleeve_mask_f, False
+
+    allowed = cv2.GaussianBlur(envelope.astype(np.float32) / 255.0, (9, 9), 2.0)
+    allowed = np.clip(allowed * 1.12, 0.0, 1.0)
+    clipped = np.clip(sleeve_mask_f.astype(np.float32) * allowed, 0.0, 1.0)
+    if int((clipped > 0.05).sum()) < 50:
+        return sleeve_rgb, sleeve_mask_f, False
+
+    old_area = max(1, int((sleeve_mask_f > 0.05).sum()))
+    new_area = int((clipped > 0.05).sum())
+    if new_area < old_area * 0.35:
+        return sleeve_rgb, sleeve_mask_f, False
+
+    return sleeve_rgb, clipped, True
 
 
 def _shape_sleeve_to_arm_contour(
@@ -579,6 +789,546 @@ def _enforce_garment_identity(
     return np.clip(result, 0, 255).astype(np.uint8)
 
 
+def _apply_dress_gpu_refine_layer(
+    source_rgb: np.ndarray,
+    diffusion_rgb: np.ndarray,
+    garment_mask: np.ndarray,
+    strength: float = 0.58,
+) -> np.ndarray:
+    """Use GPU diffusion for dress folds/lighting without redrawing the print.
+
+    This is the dress equivalent of the top GPU refine path: diffusion owns the
+    cloth lighting and drape cues, while source RGB keeps the exact print so SD
+    does not hallucinate a second/generated pattern layer.
+    """
+    diffusion_rgb = _fit_like(diffusion_rgb, source_rgb, is_mask=False)
+    garment_mask = _fit_like(garment_mask, source_rgb, is_mask=True)
+    mask = garment_mask > 20
+    if int(mask.sum()) < 500:
+        return source_rgb
+
+    mask_f = cv2.GaussianBlur(mask.astype(np.float32), (19, 19), 6.0)
+    mask_f = np.clip(mask_f * float(np.clip(strength, 0.0, 1.0)) * 0.82, 0.0, 0.82)
+
+    src_lab = cv2.cvtColor(source_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    dif_lab = cv2.cvtColor(diffusion_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    src_l = src_lab[:, :, 0]
+    dif_l = cv2.GaussianBlur(dif_lab[:, :, 0], (0, 0), 1.8)
+
+    src_low = cv2.GaussianBlur(src_l, (0, 0), 16.0)
+    dif_low = cv2.GaussianBlur(dif_l, (0, 0), 16.0)
+    broad_delta = dif_low - src_low
+    broad_delta = broad_delta - float(np.median(broad_delta[mask]))
+    broad_delta = np.clip(broad_delta, -28.0, 28.0)
+
+    src_mid = cv2.GaussianBlur(src_l, (0, 0), 4.8) - src_low
+    dif_mid = cv2.GaussianBlur(dif_l, (0, 0), 4.8) - dif_low
+    fold_delta = cv2.GaussianBlur(dif_mid - src_mid, (0, 0), 3.2)
+    fold_delta = np.clip(fold_delta, -24.0, 24.0)
+
+    delta = np.clip(
+        broad_delta * 0.72 + fold_delta * 0.34,
+        -30.0,
+        30.0,
+    )
+    src_lab[:, :, 0] = np.clip(src_l + delta * mask_f, 0, 255)
+    return cv2.cvtColor(_safe_uint8(src_lab), cv2.COLOR_LAB2RGB)
+
+
+def _suppress_dress_edge_halo(
+    output_rgb: np.ndarray,
+    person_rgb: np.ndarray,
+    garment_mask: np.ndarray,
+) -> np.ndarray:
+    """Remove bright/grey fringe just outside the dress footprint.
+
+    The dress edge should end at the garment mask.  Any low-saturation or
+    overly-bright residue in the outside ring is usually CPU fill/alpha bleed,
+    not valid garment texture.
+    """
+    output_rgb = _fit_like(output_rgb, person_rgb, is_mask=False)
+    garment_mask = _fit_like(garment_mask, person_rgb, is_mask=True)
+
+    mask = (garment_mask > 20).astype(np.uint8) * 255
+    if int(mask.sum()) < 255 * 500:
+        return output_rgb
+
+    outer = cv2.dilate(mask, np.ones((15, 15), np.uint8), iterations=1)
+    inner = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=1)
+    ring = cv2.subtract(outer, inner)
+    if int(ring.sum()) < 255 * 50:
+        return output_rgb
+
+    out_lab = cv2.cvtColor(output_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    person_lab = cv2.cvtColor(person_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    out_l = out_lab[:, :, 0]
+    person_l = person_lab[:, :, 0]
+
+    out_f = output_rgb.astype(np.float32)
+    person_f = person_rgb.astype(np.float32)
+    chroma = out_f.max(axis=2) - out_f.min(axis=2)
+    color_delta = np.mean(np.abs(out_f - person_f), axis=2)
+
+    ring_bool = ring > 0
+    halo = ring_bool & (
+        (out_l > person_l + 10.0) |
+        ((chroma < 34.0) & (color_delta > 14.0))
+    )
+    if int(halo.sum()) < 30:
+        return output_rgb
+
+    halo_u8 = halo.astype(np.uint8) * 255
+    halo_u8 = cv2.dilate(halo_u8, np.ones((3, 3), np.uint8), iterations=1)
+    alpha = cv2.GaussianBlur(halo_u8.astype(np.float32) / 255.0, (9, 9), 2.5)
+    alpha = np.clip(alpha * (ring > 0).astype(np.float32), 0.0, 1.0)[..., None]
+
+    result = (
+        output_rgb.astype(np.float32) * (1.0 - alpha)
+        + person_rgb.astype(np.float32) * alpha
+    )
+    return _safe_uint8(result)
+
+
+def _remove_old_collar_bleed(
+    output_rgb: np.ndarray,
+    source_rgb: np.ndarray,
+    garment_mask: np.ndarray,
+) -> tuple[np.ndarray, bool]:
+    """Replace red old-shirt collar pixels that diffusion can preserve."""
+    source_rgb = _fit_like(source_rgb, output_rgb, is_mask=False)
+    garment_mask = _fit_like(garment_mask, output_rgb, is_mask=True)
+    mask = garment_mask > 20
+    ys, xs = np.where(mask)
+    if len(xs) < 500:
+        return output_rgb, False
+
+    y1, y2 = int(ys.min()), int(ys.max())
+    x1, x2 = int(xs.min()), int(xs.max())
+    h = max(1, y2 - y1)
+    band = np.zeros(mask.shape, dtype=bool)
+    band[y1:min(mask.shape[0], y1 + int(h * 0.24)), max(0, x1 - 8):min(mask.shape[1], x2 + 9)] = True
+    band &= cv2.dilate((mask.astype(np.uint8) * 255), np.ones((13, 13), np.uint8), iterations=1) > 0
+
+    out_i = output_rgb.astype(np.int16)
+    src_i = source_rgb.astype(np.int16)
+    out_red = (
+        (out_i[:, :, 0] > out_i[:, :, 1] + 28)
+        & (out_i[:, :, 0] > out_i[:, :, 2] + 24)
+        & (out_i[:, :, 0] > 88)
+    )
+    src_red = (
+        (src_i[:, :, 0] > src_i[:, :, 1] + 22)
+        & (src_i[:, :, 0] > src_i[:, :, 2] + 18)
+        & (src_i[:, :, 0] > 82)
+    )
+    bleed = band & out_red & ~src_red
+    if int(bleed.sum()) < 12:
+        return output_rgb, False
+
+    bleed_u8 = cv2.dilate(bleed.astype(np.uint8) * 255, np.ones((5, 5), np.uint8), iterations=1)
+    alpha = cv2.GaussianBlur(bleed_u8.astype(np.float32) / 255.0, (7, 7), 2.0)[..., None]
+    alpha = np.clip(alpha, 0.0, 1.0)
+    result = (
+        output_rgb.astype(np.float32) * (1.0 - alpha)
+        + source_rgb.astype(np.float32) * alpha
+    )
+    return _safe_uint8(result), True
+
+
+def _inpaint_old_red_bleed(
+    output_rgb: np.ndarray,
+    garment_mask: np.ndarray,
+    parsing: dict | None = None,
+    protect_hair: bool = False,
+    allow_large_upper: bool = True,
+) -> tuple[np.ndarray, bool]:
+    """Inpaint old red shirt/sleeve bleed inside the generated dress layer."""
+    garment_mask = _fit_like(garment_mask, output_rgb, is_mask=True)
+    mask = garment_mask > 20
+    if int(mask.sum()) < 500:
+        return output_rgb, False
+
+    protect = np.zeros(mask.shape, dtype=np.uint8)
+    if parsing:
+        # Hair is intentionally not protected before HairOverlay: try_on()
+        # restores hair later, and protecting it lets the old red collar stay
+        # connected to the hair component. For post-HairOverlay cleanup callers
+        # can protect hair explicitly.
+        protect_keys = ("face", "hat", "sunglasses", "hair") if protect_hair else ("face", "hat", "sunglasses")
+        for key in protect_keys:
+            region = parsing.get(key)
+            if region is not None:
+                protect = cv2.bitwise_or(
+                    protect,
+                    (_fit_like(region, output_rgb, is_mask=True) > 20).astype(np.uint8) * 255,
+                )
+        protect_k = 17 if protect_hair else 7
+        protect = cv2.dilate(protect, np.ones((protect_k, protect_k), np.uint8), iterations=1)
+
+    rgb_i = output_rgb.astype(np.int16)
+    red_bleed = (
+        (rgb_i[:, :, 0] > rgb_i[:, :, 1] + 30)
+        & (rgb_i[:, :, 0] > rgb_i[:, :, 2] + 24)
+        & (rgb_i[:, :, 0] > 88)
+        & (rgb_i[:, :, 1] < 150)
+        & (rgb_i[:, :, 2] < 145)
+        & mask
+        & (protect == 0)
+    )
+    if int(red_bleed.sum()) < 20:
+        return output_rgb, False
+
+    red_u8 = red_bleed.astype(np.uint8) * 255
+    ys, _xs = np.where(mask)
+    top_limit = int(ys.min() + max(1, ys.max() - ys.min()) * 0.28) if len(ys) else 0
+    num, labels, stats, centroids = cv2.connectedComponentsWithStats(red_u8, 8)
+    filtered = np.zeros_like(red_u8)
+    max_component = max(120, int(mask.sum() * 0.025))
+    for idx in range(1, num):
+        area = int(stats[idx, cv2.CC_STAT_AREA])
+        centroid_y = float(centroids[idx][1])
+        is_upper_collar_bleed = allow_large_upper and parsing is not None and centroid_y <= top_limit
+        if 12 <= area and (area <= max_component or is_upper_collar_bleed):
+            filtered[labels == idx] = 255
+
+    if int((filtered > 0).sum()) < 20:
+        return output_rgb, False
+
+    red_u8 = cv2.dilate(filtered, np.ones((5, 5), np.uint8), iterations=1)
+    red_u8 = cv2.bitwise_and(red_u8, (mask.astype(np.uint8) * 255))
+    red_u8 = cv2.bitwise_and(red_u8, cv2.bitwise_not(protect))
+    bgr = cv2.cvtColor(output_rgb, cv2.COLOR_RGB2BGR)
+    fixed = cv2.inpaint(bgr, red_u8, inpaintRadius=5, flags=cv2.INPAINT_TELEA)
+    fixed_rgb = cv2.cvtColor(fixed, cv2.COLOR_BGR2RGB)
+    alpha = cv2.GaussianBlur((red_u8 > 0).astype(np.float32), (7, 7), 2.0)[..., None]
+    alpha = np.clip(alpha, 0.0, 1.0)
+    result = output_rgb.astype(np.float32) * (1.0 - alpha) + fixed_rgb.astype(np.float32) * alpha
+    return _safe_uint8(result), True
+
+
+def _paste_original_hair_layer(
+    base_rgb: np.ndarray,
+    person_rgb: np.ndarray,
+    parsing: dict | None,
+) -> tuple[np.ndarray, bool]:
+    """Paste the original hair back after garment cleanup/refinement."""
+    if not parsing or "hair" not in parsing:
+        return base_rgb, False
+
+    hair_raw = (_fit_like(parsing["hair"], base_rgb, is_mask=True) > 20).astype(np.uint8) * 255
+    if int(hair_raw.sum()) < 255 * 40:
+        return base_rgb, False
+
+    hair_mask = cv2.morphologyEx(hair_raw, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), iterations=1)
+    old_upper = get_clothing_mask(parsing)
+    if old_upper is not None:
+        old_upper = (_fit_like(old_upper, base_rgb, is_mask=True) > 20).astype(np.uint8) * 255
+        old_upper = cv2.dilate(old_upper, np.ones((5, 5), np.uint8), iterations=1)
+        person_i = person_rgb.astype(np.int16)
+        shirt_red = (
+            (person_i[:, :, 0] > person_i[:, :, 1] + 36)
+            & (person_i[:, :, 0] > person_i[:, :, 2] + 30)
+            & (person_i[:, :, 0] > 105)
+            & (person_i[:, :, 1] < 130)
+            & (person_i[:, :, 2] < 125)
+        ).astype(np.uint8) * 255
+        hair_mask = cv2.subtract(hair_mask, cv2.bitwise_and(shirt_red, old_upper))
+
+    if int(hair_mask.sum()) < 255 * 40:
+        return base_rgb, False
+
+    hair_alpha = cv2.GaussianBlur(
+        hair_mask.astype(np.float32) / 255.0,
+        (7, 7),
+        1.8,
+    )[..., None]
+    hair_alpha = np.clip(hair_alpha, 0.0, 1.0)
+    output = _safe_uint8(
+        base_rgb.astype(np.float32) * (1.0 - hair_alpha)
+        + person_rgb.astype(np.float32) * hair_alpha
+    )
+    return output, True
+
+
+def _complete_dress_body_mask(
+    body_mask: np.ndarray,
+    full_pose: dict | None,
+) -> np.ndarray:
+    """Make the lower dress footprint continuous before diffusion.
+
+    Affine bodycon masks often taper too aggressively at the hem, leaving shorts
+    visible and giving diffusion an incomplete skirt seed.  This preserves the
+    existing upper body but keeps hip-to-hem rows at a reasonable dress width.
+    """
+    mask = (body_mask > 20).astype(np.uint8) * 255
+    ys, xs = np.where(mask > 0)
+    if len(xs) < 500:
+        return mask
+
+    y1, y2 = int(ys.min()), int(ys.max())
+    dress_h = max(1, y2 - y1)
+    row_widths = []
+    for frac in (0.35, 0.42, 0.50, 0.58):
+        row = max(0, min(mask.shape[0] - 1, y1 + int(dress_h * frac)))
+        nz = np.where(mask[row] > 0)[0]
+        if len(nz) > 4:
+            row_widths.append(int(nz.max() - nz.min()))
+    if not row_widths:
+        return mask
+
+    ref_width = int(np.median(row_widths))
+    min_hem_width = max(54, int(ref_width * 0.92))
+    min_mid_width = max(min_hem_width, int(ref_width * 1.02))
+
+    body_center_x = float(np.median(xs))
+    if full_pose is not None and "left_hip" in full_pose and "right_hip" in full_pose:
+        body_center_x = float((full_pose["left_hip"][0] + full_pose["right_hip"][0]) * 0.5)
+
+    result = mask.copy()
+    start_y = y1 + int(dress_h * 0.52)
+    for row in range(start_y, y2 + 1):
+        progress = (row - start_y) / max(1, y2 - start_y)
+        target_w = int((1.0 - progress) * min_mid_width + progress * min_hem_width)
+        nz = np.where(result[row] > 0)[0]
+        if len(nz) > 4:
+            cx = float((nz.min() + nz.max()) * 0.5)
+            cur_w = int(nz.max() - nz.min())
+        else:
+            cx = body_center_x
+            cur_w = 0
+        if cur_w >= target_w:
+            continue
+        x1 = max(0, int(round(cx - target_w * 0.5)))
+        x2 = min(result.shape[1] - 1, int(round(cx + target_w * 0.5)))
+        result[row, x1:x2 + 1] = 255
+
+    result = cv2.morphologyEx(result, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8), iterations=1)
+    result = cv2.GaussianBlur(result, (3, 3), 0.6)
+    return np.clip(result, 0, 255).astype(np.uint8)
+
+
+def _fit_dress_body_mask_to_pose(
+    body_mask: np.ndarray,
+    full_pose: dict | None,
+) -> tuple[np.ndarray, bool]:
+    """Keep the dress footprint close to the model shoulder/waist/hip size."""
+    if full_pose is None:
+        return body_mask, False
+    required = ("left_shoulder", "right_shoulder", "left_hip", "right_hip")
+    if any(k not in full_pose for k in required):
+        return body_mask, False
+
+    mask = (body_mask > 20).astype(np.uint8) * 255
+    ys, xs = np.where(mask > 0)
+    if len(xs) < 500:
+        return body_mask, False
+
+    h, w = mask.shape[:2]
+    ls = np.array(full_pose["left_shoulder"], dtype=np.float32)
+    rs = np.array(full_pose["right_shoulder"], dtype=np.float32)
+    lh = np.array(full_pose["left_hip"], dtype=np.float32)
+    rh = np.array(full_pose["right_hip"], dtype=np.float32)
+    sw = max(24.0, float(np.linalg.norm(ls - rs)))
+    hip_w = max(18.0, float(abs(lh[0] - rh[0])))
+    y1, y2 = int(ys.min()), int(ys.max())
+    shoulder_y = float(min(ls[1], rs[1]))
+    hip_y = float(max(lh[1], rh[1]))
+    top_y = max(y1, int(shoulder_y - sw * 0.22))
+    bot_y = y2
+    if bot_y <= top_y + 20:
+        return body_mask, False
+
+    shoulder_cx = float((ls[0] + rs[0]) * 0.5)
+    hip_cx = float((lh[0] + rh[0]) * 0.5)
+    env = np.zeros_like(mask)
+    width_curve = np.array([
+        [0.00, sw * 0.62],
+        [0.18, sw * 0.56],
+        [0.42, max(sw * 0.48, hip_w * 0.72)],
+        [0.66, max(sw * 0.50, hip_w * 0.78)],
+        [1.00, max(sw * 0.54, hip_w * 0.86)],
+    ], dtype=np.float32)
+
+    for y in range(top_y, min(h, bot_y + 1)):
+        f = (y - top_y) / max(1.0, float(bot_y - top_y))
+        cx_f = min(1.0, max(0.0, (y - shoulder_y) / max(1.0, hip_y - shoulder_y)))
+        cx = shoulder_cx * (1.0 - cx_f) + hip_cx * cx_f
+        half_w = float(np.interp(f, width_curve[:, 0], width_curve[:, 1]))
+        x_l = max(0, int(round(cx - half_w)))
+        x_r = min(w - 1, int(round(cx + half_w)))
+        env[y, x_l:x_r + 1] = 255
+
+    env = cv2.GaussianBlur(env, (9, 9), 2.0)
+    env = (env > 24).astype(np.uint8) * 255
+    clipped = cv2.bitwise_and(mask, env)
+
+    old_area = int(cv2.countNonZero(mask))
+    new_area = int(cv2.countNonZero(clipped))
+    if new_area < max(500, int(old_area * 0.58)):
+        return body_mask, False
+
+    clipped = cv2.morphologyEx(clipped, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=1)
+    return clipped, True
+
+
+def _propagate_texture_into_mask(
+    image_rgb: np.ndarray,
+    target_mask: np.ndarray,
+    valid_mask: np.ndarray,
+    max_iter: int = 80,
+) -> np.ndarray:
+    """Fill target pixels from nearest valid garment texture, avoiding grey BG."""
+    target = target_mask > 20
+    valid = (valid_mask > 0) & target
+    if int(target.sum()) < 50 or int(valid.sum()) < 30:
+        return image_rgb
+
+    result = image_rgb.copy()
+    current = valid.copy()
+    missing = target & ~current
+    h, w = target.shape[:2]
+    shifts = (
+        (-1, 0), (1, 0), (0, -1), (0, 1),
+        (-1, -1), (-1, 1), (1, -1), (1, 1),
+    )
+
+    for _ in range(max_iter):
+        if not missing.any():
+            break
+        filled_any = False
+        filled = np.zeros_like(current, dtype=bool)
+
+        for dy, dx in shifts:
+            src_y1 = max(0, -dy)
+            src_y2 = min(h, h - dy)
+            src_x1 = max(0, -dx)
+            src_x2 = min(w, w - dx)
+            dst_y1 = max(0, dy)
+            dst_y2 = min(h, h + dy)
+            dst_x1 = max(0, dx)
+            dst_x2 = min(w, w + dx)
+
+            neighbor = np.zeros_like(current, dtype=bool)
+            neighbor[dst_y1:dst_y2, dst_x1:dst_x2] = current[src_y1:src_y2, src_x1:src_x2]
+            fill = missing & neighbor & ~filled
+            if not fill.any():
+                continue
+
+            shifted_rgb = np.zeros_like(result)
+            shifted_rgb[dst_y1:dst_y2, dst_x1:dst_x2] = result[src_y1:src_y2, src_x1:src_x2]
+            result[fill] = shifted_rgb[fill]
+            filled[fill] = True
+            filled_any = True
+
+        if not filled_any:
+            break
+        current[filled] = True
+        missing = target & ~current
+
+    if missing.any():
+        median_rgb = np.median(result[current], axis=0).astype(np.uint8)
+        result[missing] = median_rgb
+
+    return result
+
+
+def _garment_texture_valid_mask(image_rgb: np.ndarray, base_mask: np.ndarray) -> np.ndarray:
+    """Select real garment texture pixels, excluding flat neutral warp fill."""
+    base = base_mask > 20
+    if int(base.sum()) < 50:
+        return base
+
+    img_i = image_rgb.astype(np.int16)
+    rgb_sum = img_i.sum(axis=2)
+    chroma = img_i.max(axis=2) - img_i.min(axis=2)
+    gray = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    local_mean = cv2.GaussianBlur(gray, (0, 0), 2.0)
+    local_sq = cv2.GaussianBlur(gray * gray, (0, 0), 2.0)
+    local_std = np.sqrt(np.maximum(local_sq - local_mean * local_mean, 0.0))
+    base_pixels = image_rgb[base]
+    median_rgb = np.median(base_pixels, axis=0).astype(np.float32) if len(base_pixels) else np.array([128, 128, 128], dtype=np.float32)
+    color_dist = np.mean(np.abs(image_rgb.astype(np.float32) - median_rgb[None, None, :]), axis=2)
+
+    neutral_fill = (rgb_sum > 330) & (rgb_sum < 505) & (chroma < 28) & (local_std < 9.0)
+    flat_fill = (rgb_sum > 250) & (chroma < 34) & (local_std < 4.5)
+    too_dark = rgb_sum < 45
+    pattern_detail = (color_dist > 26.0) | (chroma > 32) | (rgb_sum < 330) | (rgb_sum > 520)
+    valid = base & pattern_detail & ~neutral_fill & ~flat_fill & ~too_dark
+
+    if int(valid.sum()) < max(30, int(base.sum() * 0.08)):
+        valid = base & ~neutral_fill & ~flat_fill & ~too_dark
+    if int(valid.sum()) < max(30, int(base.sum() * 0.08)):
+        valid = base & ~too_dark & (chroma > 8)
+    return valid
+
+
+def _repeat_row_texture_into_mask(
+    image_rgb: np.ndarray,
+    target_mask: np.ndarray,
+    valid_mask: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Extend patterned garment rows sideways instead of flat edge colors."""
+    target = target_mask > 20
+    valid = (valid_mask > 0) & target
+    result = image_rgb.copy()
+    filled = np.zeros(target.shape[:2], dtype=bool)
+    if int(target.sum()) < 50 or int(valid.sum()) < 30:
+        return result, filled
+
+    rows = np.where(target.any(axis=1))[0]
+    for y in rows:
+        source_x = np.where(valid[y])[0]
+        missing_x = np.where(target[y] & ~valid[y])[0]
+        if len(source_x) < 4 or len(missing_x) == 0:
+            continue
+
+        first = int(source_x[0])
+        last = int(source_x[-1])
+        n_src = len(source_x)
+        for x in missing_x:
+            x_i = int(x)
+            if x_i < first:
+                src_idx = (first - x_i) % n_src
+            elif x_i > last:
+                src_idx = n_src - 1 - ((x_i - last) % n_src)
+            else:
+                insert_at = int(np.searchsorted(source_x, x_i))
+                if insert_at <= 0:
+                    src_idx = 0
+                elif insert_at >= n_src:
+                    src_idx = n_src - 1
+                else:
+                    left_i = insert_at - 1
+                    right_i = insert_at
+                    src_idx = left_i if x_i - source_x[left_i] <= source_x[right_i] - x_i else right_i
+            result[y, x_i] = image_rgb[y, source_x[src_idx]]
+            filled[y, x_i] = True
+
+    return result, filled
+
+
+def _extend_dress_texture_to_mask(
+    warped_cloth: np.ndarray,
+    warped_mask: np.ndarray,
+    support_mask: np.ndarray,
+) -> np.ndarray:
+    """Inpaint source dress texture into support pixels added for skirt coverage."""
+    support = (support_mask > 20).astype(np.uint8) * 255
+    existing = warped_mask > 20
+    if int((support > 0).sum()) < 50 or int(existing.sum()) < 300:
+        return warped_cloth
+
+    valid = _garment_texture_valid_mask(warped_cloth, existing.astype(np.uint8) * 255)
+    row_filled, row_fill_mask = _repeat_row_texture_into_mask(warped_cloth, support, valid)
+
+    return _propagate_texture_into_mask(
+        row_filled,
+        support,
+        valid | row_fill_mask,
+        max_iter=120,
+    )
+
+
 def _match_cloth_brightness(
     warped_cloth: np.ndarray,
     person_rgb: np.ndarray,
@@ -616,136 +1366,6 @@ def _match_cloth_brightness(
     out = warped_cloth.copy()
     out[mask_bool] = result[mask_bool]
     return out
-
-
-def _apply_texture_preserving_dress_folds(
-    garment_rgb: np.ndarray,
-    garment_mask: np.ndarray,
-    full_pose: dict | None,
-) -> np.ndarray:
-    """Add subtle fold lighting without changing the source print."""
-    mask = garment_mask > 30
-    if int(mask.sum()) < 500:
-        return garment_rgb
-
-    h, w = garment_mask.shape[:2]
-    ys, xs = np.where(mask)
-    x1, x2 = int(xs.min()), int(xs.max())
-    y1, y2 = int(ys.min()), int(ys.max())
-    width = max(1, x2 - x1)
-    height = max(1, y2 - y1)
-
-    if full_pose is not None and "left_shoulder" in full_pose and "right_shoulder" in full_pose:
-        ls = np.array(full_pose["left_shoulder"], dtype=np.float32)
-        rs = np.array(full_pose["right_shoulder"], dtype=np.float32)
-        center_x = float((ls[0] + rs[0]) * 0.5)
-    else:
-        center_x = float((x1 + x2) * 0.5)
-
-    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
-    xn = (xx - center_x) / max(1.0, width * 0.5)
-    yn = (yy - y1) / max(1.0, height)
-
-    side_shadow = -0.105 * np.exp(-((np.abs(xn) - 0.62) ** 2) / 0.035)
-    center_highlight = 0.065 * np.exp(-(xn ** 2) / 0.18) * (0.35 + 0.65 * yn)
-    fine_folds = 0.044 * np.sin((xn * 3.8 + yn * 1.4) * np.pi) * (0.25 + 0.75 * yn)
-    waist_shadow = -0.040 * np.exp(-((yn - 0.42) ** 2) / 0.018) * np.exp(-(xn ** 2) / 0.72)
-    hem_shadow = -0.060 * np.clip((yn - 0.72) / 0.28, 0.0, 1.0)
-
-    fold = side_shadow + center_highlight + fine_folds + waist_shadow + hem_shadow
-    fold = cv2.GaussianBlur(fold.astype(np.float32), (0, 0), 5.0)
-    fold_mask = cv2.GaussianBlur(mask.astype(np.float32), (15, 15), 5.0)
-    fold = fold * np.clip(fold_mask, 0.0, 1.0)
-
-    out = garment_rgb.astype(np.float32) * (1.0 + fold[..., None])
-    return _safe_uint8(out)
-
-
-def _blend_luminance_from_diffusion(
-    base_rgb: np.ndarray,
-    diffusion_rgb: np.ndarray,
-    garment_mask: np.ndarray,
-    strength: float = 0.45,
-    broad_strength: float = 0.45,
-) -> np.ndarray:
-    """Use diffusion for fold lighting only, preserving base color/print."""
-    diffusion_rgb = _fit_like(diffusion_rgb, base_rgb, is_mask=False)
-    garment_mask = _fit_like(garment_mask, base_rgb, is_mask=True)
-
-    mask_f = (garment_mask > 30).astype(np.float32)
-    if int(mask_f.sum()) < 500:
-        return base_rgb
-    mask_f = cv2.GaussianBlur(mask_f, (15, 15), 5.0)
-    mask_f = np.clip(mask_f * np.clip(strength, 0.0, 1.0), 0.0, 1.0)
-
-    base_lab = cv2.cvtColor(base_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
-    diff_lab = cv2.cvtColor(diffusion_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
-    base_l = base_lab[:, :, 0]
-    diff_l = diff_lab[:, :, 0]
-
-    # Keep medium-frequency fold lighting and a controlled amount of broad
-    # drape shading. Removing only global exposure drift avoids recoloring the
-    # original garment while still letting GPU add body-following folds.
-    base_blur = cv2.GaussianBlur(base_l, (0, 0), 11.0)
-    diff_blur = cv2.GaussianBlur(diff_l, (0, 0), 11.0)
-    medium_delta = (diff_l - diff_blur) - (base_l - base_blur)
-
-    broad_delta = diff_blur - base_blur
-    active = mask_f > 0.05
-    if int(active.sum()) > 200:
-        broad_delta = broad_delta - float(np.median(broad_delta[active]))
-
-    delta = np.clip(
-        medium_delta + broad_delta * np.clip(broad_strength, 0.0, 1.0),
-        -42.0,
-        42.0,
-    )
-
-    base_lab[:, :, 0] = np.clip(base_l + delta * mask_f, 0, 255)
-    return cv2.cvtColor(_safe_uint8(base_lab), cv2.COLOR_LAB2RGB)
-
-
-def _apply_body_shade_from_person(
-    garment_rgb: np.ndarray,
-    person_rgb: np.ndarray,
-    garment_mask: np.ndarray,
-    strength: float = 0.55,
-) -> np.ndarray:
-    """v16.46: Transfer real body shading (chest/waist/side shadows) from the
-    original person photo onto the warped garment.
-
-    The original person already wears clothing whose luminance follows the body
-    curvature (highlights on chest/abdomen, shadows on the sides where the body
-    rounds away from light, darker waist crease, hem shadow, etc.). We extract
-    that low-frequency luminance pattern from `person_rgb` inside the garment
-    region, normalise it around its mean, and modulate the garment luminance
-    accordingly. Pattern/colour are preserved (we only scale L in LAB)."""
-    person_rgb = _fit_like(person_rgb, garment_rgb, is_mask=False)
-    garment_mask = _fit_like(garment_mask, garment_rgb, is_mask=True)
-
-    mask_bool = garment_mask > 30
-    if int(mask_bool.sum()) < 800:
-        return garment_rgb
-
-    person_lab = cv2.cvtColor(person_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
-    person_l = person_lab[:, :, 0]
-
-    # Low-frequency body shading only — large blur removes fabric texture / print.
-    body_shade = cv2.GaussianBlur(person_l, (0, 0), 22.0)
-    inside_vals = body_shade[mask_bool]
-    if inside_vals.size < 400:
-        return garment_rgb
-    mean_val = float(np.median(inside_vals))
-    shade_delta = body_shade - mean_val
-    # Limit magnitude so pattern luminance is not crushed.
-    shade_delta = np.clip(shade_delta, -28.0, 22.0)
-
-    mask_f = cv2.GaussianBlur(mask_bool.astype(np.float32), (21, 21), 7.0)
-    mask_f = np.clip(mask_f * float(np.clip(strength, 0.0, 1.5)), 0.0, 1.0)
-
-    garment_lab = cv2.cvtColor(garment_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
-    garment_lab[:, :, 0] = np.clip(garment_lab[:, :, 0] + shade_delta * mask_f, 0, 255)
-    return cv2.cvtColor(_safe_uint8(garment_lab), cv2.COLOR_LAB2RGB)
 
 
 def _soft_mask(mask: np.ndarray, blur_sigma: float = 0.5, erode_px: int = 1) -> np.ndarray:
@@ -1257,37 +1877,22 @@ def _run_cpu_geometric_pipeline(
         # TPS over-constrains long bodycon dresses; affine keeps the original
         # silhouette of the dress and just scales it onto the person.
         try:
-            # v16.47: Body-fit dress warp — anchors neck/shoulder/waist/hip on
-            # the person while preserving the original dress's per-row flare
-            # below the hip. This fixes the "pasted-on" feel: the dress now
-            # follows the actual torso shape (snug at waist, full at hips,
-            # skirt extends to ankles with the source dress's silhouette).
-            warped_cloth, warped_mask = body_fit_warp_dress(
+            warped_cloth, warped_mask = simple_affine_warp_cloth(
                 cloth_rgb=scaled_cloth,
                 cloth_mask=scaled_mask,
                 pose=full_pose,
                 output_shape=(h_out, w_out),
+                garment_category="dress",
             )
-            pipeline_info.append("BodyFit_dress")
+            pipeline_info.append("Affine_dress")
         except Exception as e:
-            pipeline_info.append(f"BodyFit_dress_fail({e})")
-            try:
-                warped_cloth, warped_mask = simple_affine_warp_cloth(
-                    cloth_rgb=scaled_cloth,
-                    cloth_mask=scaled_mask,
-                    pose=full_pose,
-                    output_shape=(h_out, w_out),
-                    garment_category="dress",
-                )
-                pipeline_info.append("Affine_dress")
-            except Exception as e2:
-                pipeline_info.append(f"Affine_dress_fail({e2})")
-                warped_cloth, warped_mask = warp_cloth_to_torso(
-                    person_rgb=person_rgb, cloth_rgb=cloth_rgb,
-                    cloth_mask=cloth_mask, box=pose_box,
-                    fit_scale=fit_scale, y_offset_ratio=y_offset,
-                )
-                pipeline_info.append("Persp")
+            pipeline_info.append(f"Affine_dress_fail({e})")
+            warped_cloth, warped_mask = warp_cloth_to_torso(
+                person_rgb=person_rgb, cloth_rgb=cloth_rgb,
+                cloth_mask=cloth_mask, box=pose_box,
+                fit_scale=fit_scale, y_offset_ratio=y_offset,
+            )
+            pipeline_info.append("Persp")
     else:
         warped_cloth, warped_mask = warp_cloth_to_torso(
             person_rgb=person_rgb, cloth_rgb=cloth_rgb,
@@ -1345,34 +1950,6 @@ def _run_cpu_geometric_pipeline(
                                              borderMode=cv2.BORDER_CONSTANT, borderValue=0)
                 pipeline_info.append(f"DriftFix({_drift:.0f}px)")
 
-        # v16.28: For DRESS, clip warped_mask to the PERSON SILHOUETTE so the
-        # paste never extends beyond the actual body (which causes a visible
-        # outline of the warped torso sitting on top of the diffusion result,
-        # i.e. the 'two-layer' look). Diffusion still owns the boundary ring.
-        # v16.36: Use ERODED silhouette (5px) instead of dilated, so the warp
-        # never bleeds outside body — the phantom dress on the left was the
-        # warp leaking past the silhouette boundary.
-        if garment_category == "dress" and parsing:
-            _sil = np.zeros(warped_mask.shape, dtype=np.uint8)
-            for _sk in (
-                "face", "hair", "hat", "sunglasses",
-                "upper_clothes", "dress", "coat", "scarf",
-                "left_arm", "right_arm", "neck",
-                "pants", "skirt", "left_leg", "right_leg",
-                "left_shoe", "right_shoe",
-            ):
-                _sv = parsing.get(_sk)
-                if _sv is not None:
-                    _sil = cv2.bitwise_or(_sil, _sv)
-            if int(_sil.sum()) > 255 * 500:
-                _sil = cv2.morphologyEx(_sil, cv2.MORPH_CLOSE,
-                                        np.ones((11, 11), np.uint8))
-                # v16.36: ERODE 3px instead of dilate 5px so warp stays
-                # strictly inside body silhouette, no overflow.
-                _sil = cv2.erode(_sil, np.ones((3, 3), np.uint8), iterations=1)
-                warped_mask = cv2.bitwise_and(warped_mask, _sil)
-                pipeline_info.append("WarpClipSil")
-
         # v16.9: Hair subtract REMOVED.
         # Previously subtracted hair from warped_mask+warped_cloth → garment erased
         # under hair → no garment data for diffusion or compositing under hair.
@@ -1418,10 +1995,10 @@ def _run_cpu_geometric_pipeline(
             warped_cloth[:, :, c] = (warped_cloth[:, :, c].astype(np.float32) * body_f).astype(np.uint8)
         pipeline_info.append("SleeveClip")
 
-    # ── Step 4c: Sleeve warp (LONG sleeves) ──
-    # v16.41: Allow dress long sleeves again. Affine dress warp preserves the
-    # torso print, but it often misses the user's arms; because dress erase
-    # removes full arms, skipping sleeve warp leaves gray fill columns.
+    # ── Step 4c: Sleeve warp (TOP/DRESS garments with LONG sleeves) ──
+    # v16.68: Dresses use the same sleeve warp as tops, but the old
+    # Dress-only SleeveArmCover expansion is removed. That expansion caused
+    # large round shoulder caps and a second visible sleeve layer.
     sleeve_data = {}  # side -> (rgb, mask_float)
     if garment_category in ("top", "dress") and full_pose is not None and new_sleeve_type == "long":
         try:
@@ -1436,12 +2013,83 @@ def _run_cpu_geometric_pipeline(
                 sleeve_data = sleeve_result
                 for side, (s_rgb, s_mask_f) in sleeve_data.items():
                     s_rgb = _safe_uint8(s_rgb)
+                    if garment_category == "dress":
+                        s_rgb, s_mask_f, _sleeve_clipped = _clip_sleeve_to_arm_pose(
+                            s_rgb,
+                            s_mask_f,
+                            full_pose,
+                            parsing,
+                            side,
+                        )
+                        if _sleeve_clipped:
+                            pipeline_info.append(f"DressSleevePoseClip:{side}:v16.72")
                     sleeve_data[side] = (s_rgb, s_mask_f)
                     _debug_save(f"04c_sleeve_{side}_rgb", s_rgb)
                     _debug_save(f"04c_sleeve_{side}_mask", (s_mask_f * 255).astype(np.uint8), is_mask=True)
-                pipeline_info.append("Sleeves")
         except Exception:
             pass  # Sleeve warp failed, keep torso-only result
+
+    # Unified garment support used by dress erase/diffusion.  The base affine
+    # mask can be narrower than the cleaned old-clothes area; include
+    # independently warped sleeves so later stages do not preserve a grey
+    # body-shaped underlayer around the visible dress.
+    dress_body_support_mask = (warped_mask > 20).astype(np.uint8) * 255
+    if garment_category == "dress":
+        completed_body = _complete_dress_body_mask(dress_body_support_mask, full_pose)
+        if int(cv2.countNonZero(completed_body)) > int(cv2.countNonZero(dress_body_support_mask)) + 80:
+            dress_body_support_mask = completed_body
+            pipeline_info.append("DressSkirtComplete:v16.60")
+        pose_fit_body, _pose_fit_applied = _fit_dress_body_mask_to_pose(
+            dress_body_support_mask,
+            full_pose,
+        )
+        if _pose_fit_applied:
+            dress_body_support_mask = pose_fit_body
+            pipeline_info.append("DressBodyPoseFit:v16.72")
+
+    garment_support_mask = dress_body_support_mask.copy()
+    for _s_rgb, _s_mask_f in sleeve_data.values():
+        _s_u8 = (_s_mask_f > 0.04).astype(np.uint8) * 255
+        garment_support_mask = cv2.bitwise_or(garment_support_mask, _s_u8)
+    if garment_category == "dress":
+        if parsing and full_pose is not None:
+            _old_upper = get_clothing_mask(parsing)
+            if _old_upper is not None and "left_shoulder" in full_pose and "right_shoulder" in full_pose:
+                _ls = np.array(full_pose["left_shoulder"], dtype=np.float32)
+                _rs = np.array(full_pose["right_shoulder"], dtype=np.float32)
+                _sw = max(20.0, float(np.linalg.norm(_ls - _rs)))
+                _sh_y = float((_ls[1] + _rs[1]) * 0.5)
+                yy, xx = np.indices((h_out, w_out))
+                _band = (
+                    (yy >= int(max(0, _sh_y - _sw * 0.24)))
+                    & (yy <= int(min(h_out - 1, _sh_y + _sw * 0.50)))
+                    & (xx >= int(max(0, min(_ls[0], _rs[0]) - _sw * 0.28)))
+                    & (xx <= int(min(w_out - 1, max(_ls[0], _rs[0]) + _sw * 0.28)))
+                ).astype(np.uint8) * 255
+                _near_dress = cv2.dilate(
+                    garment_support_mask,
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31)),
+                    iterations=1,
+                )
+                _person_i = person_rgb.astype(np.int16)
+                _old_red = (
+                    (_person_i[:, :, 0] > _person_i[:, :, 1] + 28)
+                    & (_person_i[:, :, 0] > _person_i[:, :, 2] + 22)
+                    & (_person_i[:, :, 0] > 90)
+                    & (_person_i[:, :, 1] < 145)
+                ).astype(np.uint8) * 255
+                _seal_source = cv2.bitwise_or(_old_upper, _old_red)
+                _seal = cv2.bitwise_and(_seal_source, _band)
+                _seal = cv2.bitwise_and(_seal, _near_dress)
+                if int(_seal.sum()) > 255 * 20:
+                    dress_body_support_mask = cv2.bitwise_or(dress_body_support_mask, _seal)
+                    garment_support_mask = cv2.bitwise_or(garment_support_mask, _seal)
+                    pipeline_info.append("DressShoulderSeal:v16.70")
+        garment_support_mask = cv2.morphologyEx(
+            garment_support_mask, cv2.MORPH_CLOSE,
+            np.ones((5, 5), np.uint8), iterations=1,
+        )
+    _debug_save("04d_garment_support_mask", garment_support_mask, is_mask=True)
 
     # PRE-FILL warped cloth's transparent area with blurred cloth colors.
     # v16.7d: Use GaussianBlur instead of median color fill.
@@ -1487,13 +2135,15 @@ def _run_cpu_geometric_pipeline(
         # garment from overlapping onto chin. Previous 15x24 ellipse was
         # way too large → blocked garment at neckline.
         face_m = parsing.get("face")
-        if face_m is not None:
+        if face_m is not None and garment_category != "dress":
             neck_skin_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 10))
             neck_skin = cv2.dilate(face_m, neck_skin_k, iterations=1)
             face_ys = np.where(face_m > 0)[0]
             if len(face_ys) > 5:
                 neck_skin[:int(face_ys.max() * 0.97), :] = 0
             preserve_mask = cv2.bitwise_or(preserve_mask, neck_skin)
+        elif garment_category == "dress":
+            pass
         # Minimal dilation — just 3px safety margin
         preserve_mask = cv2.dilate(preserve_mask, np.ones((3, 3), np.uint8), iterations=1)
     _debug_save("05a_preserve_mask", preserve_mask, is_mask=True)
@@ -1513,17 +2163,17 @@ def _run_cpu_geometric_pipeline(
                     _dp = parsing.get(_dk)
                     if _dp is not None:
                         erase_mask = cv2.bitwise_or(erase_mask, _dp)
-                # v16.26: For dress, ERASE FULL ARMS (not just sleeve overlap).
-                # The dress sleeve from affine warp will cover them; if some
-                # arm pixels remain, the composite shows old skin / old shirt
-                # poking out next to the dress -> looks like "layered" output.
-                # Skin will be repainted by the dress mean colour fill below,
-                # then refined by diffusion at the boundary ring.
+                # v16.19: For dress, only erase the OLD CLOTHING on arms (intersection),
+                # NOT the full arm skin. Full arm erase created gray holes where the
+                # dress sleeve (from affine warp) didn't reach → gray rectangle artifact.
+                # Intersect arm_mask with old_clothes to get only the sleeve overlap area.
                 _arm_any = get_arm_mask(parsing)
-                if _arm_any is not None and int(_arm_any.sum()) > 255 * 50:
-                    _arm_dil = cv2.dilate(_arm_any, np.ones((9, 9), np.uint8), iterations=1)
-                    erase_mask = cv2.bitwise_or(erase_mask, _arm_dil)
-                    pipeline_info.append("ArmErase")
+                if _arm_any is not None:
+                    _arm_sleeve_only = cv2.bitwise_and(_arm_any, erase_mask)
+                    if int(_arm_sleeve_only.sum()) > 255 * 50:
+                        _arm_dil = cv2.dilate(_arm_sleeve_only, np.ones((5, 5), np.uint8), iterations=1)
+                        erase_mask = cv2.bitwise_or(erase_mask, _arm_dil)
+                        pipeline_info.append("ArmErase")
                 # v16.13: Add neckline-band erase — old top collars often bleed
                 # through at the dress neckline (e.g. red tank-top collar visible
                 # above the dress). Build a horizontal strip from chin to "upper
@@ -1571,12 +2221,26 @@ def _run_cpu_geometric_pipeline(
     else:
         erase_mask = (warped_mask > 20).astype(np.uint8) * 255
 
-    # Also erase where the new garment will go (union with warped mask)
-    wm_bin = (warped_mask > 20).astype(np.uint8) * 255
+    # Also erase where the new garment will go.
+    wm_bin = (
+        garment_support_mask.copy()
+        if garment_category == "dress"
+        else (warped_mask > 20).astype(np.uint8) * 255
+    )
     erase_mask = cv2.bitwise_or(erase_mask, wm_bin)
 
     # Subtract preserve areas — face/hair/neck/arms must NOT be erased
     erase_mask = cv2.subtract(erase_mask, preserve_mask)
+    if garment_category == "dress":
+        # Keep dress erase local to the new garment footprint. The broad
+        # neckline/old-clothes erase is useful for red-collar bleed, but if it
+        # extends outside the generated dress it creates visible grey slabs
+        # that diffusion then treats as part of the seed.
+        _dress_erase_support = cv2.dilate(
+            garment_support_mask, np.ones((13, 13), np.uint8), iterations=1,
+        )
+        erase_mask = cv2.bitwise_and(erase_mask, _dress_erase_support)
+        pipeline_info.append("DressEraseClip:v16.58")
     _debug_save("05b_erase_mask", erase_mask, is_mask=True)
 
     # v13 FIX: SOFT BODY REPLACEMENT instead of hard erase.
@@ -1626,14 +2290,14 @@ def _run_cpu_geometric_pipeline(
                                      iterations=1)
             _sil_f = (_person_sil > 0).astype(np.float32)[..., None]
             _hard_erase = _hard_erase * _sil_f
-        # v16.25: Split the fill by WHETHER the pixel lies inside the warped
+        # v16.54: Split the fill by WHETHER the pixel lies inside the warped
         # dress or not:
-        #   - Inside warped_mask (dilated a bit) -> dress mean colour, so any
-        #     feathering at the dress alpha edge blends invisibly.
-        #   - Outside warped_mask (arms / neck / exposed skin) -> SKIN colour
-        #     sampled from the face, so those areas look like bare skin.
-        # This prevents the "body-shaped brown silhouette" artifact when the
-        # warp is narrower than the erase region.
+        #   - Inside warped_mask -> dress mean colour, so alpha-edge feathering
+        #     blends invisibly.
+        #   - Outside warped_mask -> BACKGROUND colour, not skin colour.
+        # The old skin fill created a wide brown/grey body-shaped silhouette
+        # around the real dress. When diffusion/clip preserved that seed, it
+        # looked exactly like a second dress layer behind the garment.
         _wm_bool = (warped_mask > 64)
         if int(_wm_bool.sum()) > 200:
             _dress_rgb = warped_cloth[_wm_bool].astype(np.float32).mean(axis=0)
@@ -1646,77 +2310,55 @@ def _run_cpu_geometric_pipeline(
                 _fm = parsing.get(_face_key)
                 if _fm is not None and int(_fm.sum()) > 255 * 50:
                     _fb = (_fm > 0)
-                    _face_pixels = person_rgb[_fb].astype(np.float32)
-                    # v16.32: Filter out RED-DOMINANT pixels (red shirt collar
-                    # / lipstick / red trim leaking into the face mask). These
-                    # bias _skin_rgb toward pink, then DressFullErase paints
-                    # arms/cuffs/neck pink, then diffusion locks in a fake
-                    # red trim look. Keep only pixels where R is not >> G+B.
-                    _r = _face_pixels[:, 0]
-                    _g = _face_pixels[:, 1]
-                    _b = _face_pixels[:, 2]
-                    _not_red = (_r < (_g + _b) * 0.75 + 25) & (_r < 230)
-                    _filtered = _face_pixels[_not_red]
-                    if len(_filtered) > 50:
-                        _skin_rgb = _filtered.mean(axis=0)
-                    else:
-                        _skin_rgb = _face_pixels.mean(axis=0)
+                    _skin_rgb = person_rgb[_fb].astype(np.float32).mean(axis=0)
                     break
         if _skin_rgb is None:
             _skin_rgb = _dress_rgb.copy()
-        # v16.28: Fill dress_mean ONLY inside the actual warp footprint
-        # (dilated a few px so the alpha-edge feather blends invisibly).
-        # Outside the warp -> SKIN colour. The previous v16.27 wide column
-        # filled the entire body bbox with dress_mean, which produced a flat
-        # pinkish-grey blob at the sides that looked like a SECOND layer
-        # under the real warped torso ('chong lop' look). With skin outside,
-        # diffusion has clean source pixels to either extend the dress sleeve
-        # or leave bare arm skin.
-        _wm_inside = cv2.dilate((warped_mask > 20).astype(np.uint8) * 255,
-                                np.ones((5, 5), np.uint8), iterations=1)
+        # Sample background from image corners. For catalog/product images this
+        # is usually white/light grey and removes the old shirt/shorts without
+        # leaving a person-shaped underlayer.
+        _ch = max(6, h_out // 12)
+        _cw = max(6, w_out // 12)
+        _corner_pixels = np.concatenate([
+            person_rgb[:_ch, :_cw].reshape(-1, 3),
+            person_rgb[:_ch, -_cw:].reshape(-1, 3),
+            person_rgb[-_ch:, :_cw].reshape(-1, 3),
+            person_rgb[-_ch:, -_cw:].reshape(-1, 3),
+        ], axis=0).astype(np.float32)
+        _bg_rgb = np.median(_corner_pixels, axis=0)
+        # Guard against dark UI/card pixels if input was already cropped oddly.
+        if float(_bg_rgb.mean()) < 120:
+            _bg_rgb = np.array([245.0, 245.0, 245.0], dtype=np.float32)
+
+        # Build per-pixel fill: dress colour only inside the real warp footprint
+        # (tiny 1px safety dilation), background everywhere else. This removes
+        # the brown/grey under-dress silhouette at the source.
+        _wm_inside = cv2.dilate(
+            (garment_support_mask > 20).astype(np.uint8) * 255,
+            np.ones((9, 9), np.uint8),
+            iterations=1,
+        )
         _inside_f = (_wm_inside > 0).astype(np.float32)[..., None]
         _fill_rgb = (
             _inside_f * _dress_rgb[None, None, :]
-            + (1.0 - _inside_f) * _skin_rgb[None, None, :]
+            + (1.0 - _inside_f) * _bg_rgb[None, None, :]
         )
         person_cleaned = _safe_uint8(
             person_cleaned.astype(np.float32) * (1.0 - _hard_erase)
             + _fill_rgb * _hard_erase
         )
-        pipeline_info.append("DressFullErase")
-    pipeline_info.append("SoftErase")
-
-    # ── Step 5b: BodyCopy REMOVED (v16) ──
-    # v13-v15 BodyCopy was filling exposed areas (where old garment existed but
-    # new garment doesn't cover) with body_blurred pixels. This was the #1 cause
-    # of artifacts: re-introducing old shirt colors, dark patches, and destroying
-    # garment texture. SoftErase in Step 5 already provides a clean body background.
-    # BodyCopy is no longer needed — the garment covers the torso, and any small
-    # gaps are handled by the feathered blend in Step 7.
-    pipeline_info.append("BodyCopy:OFF")
-
+        pipeline_info.append("DressFullErase:v16.54")
     # ── Step 6: Color match cloth to person lighting ──
     # Match warped cloth brightness to person BEFORE blending.
     # This prevents the garment looking "pasted on" with different lighting.
     warped_cloth_matched = _match_cloth_brightness(warped_cloth_prefilled, person_cleaned, warped_mask)
     if garment_category == "dress":
-        warped_cloth_matched = _apply_texture_preserving_dress_folds(
+        warped_cloth_matched = _extend_dress_texture_to_mask(
             warped_cloth_matched,
             warped_mask,
-            full_pose,
+            dress_body_support_mask,
         )
-        pipeline_info.append("DressFoldShade")
-        # v16.46: BodyShade — borrow real body shading (chest highlight, side
-        # shadows, waist crease) from the original person photo so the dress
-        # follows the actual 3D body shape instead of looking like a flat
-        # cutout pasted on. Pattern/colour are unchanged (luminance only).
-        warped_cloth_matched = _apply_body_shade_from_person(
-            warped_cloth_matched,
-            person_rgb,
-            warped_mask,
-            strength=0.65,
-        )
-        pipeline_info.append("BodyShade")
+        pipeline_info.append("DressTextureFill:v16.61")
 
     # ── Step 6b: Body Curve Map + DrapeHint ──
     # v16.9: DISABLED when diffusion is primary (strength 0.75).
@@ -1725,7 +2367,7 @@ def _run_cpu_geometric_pipeline(
     # body curvature shading, and drape. CPU curve/drape only adds noise to the
     # init_image that diffusion then has to correct.
     # Only kept as light hint — reduced from previous strengths.
-    if full_pose is not None:
+    if full_pose is not None and garment_category != "dress":
         wm_bool_drape = warped_mask > 30
         if wm_bool_drape.sum() > 500:
             # v16.11b: Restrict drape to torso-center only (exclude sleeves).
@@ -1807,7 +2449,7 @@ def _run_cpu_geometric_pipeline(
 
     # v16.9: Save FULL warped_mask (including under-hair) for downstream use.
     # HairOverlay and diffusion need to know the full garment extent.
-    warped_mask_full = warped_mask.copy()
+    warped_mask_full = garment_support_mask.copy()
 
     # v16.9: Only subtract FACE (not hair) from compositing mask.
     # Garment must not overlap face, but SHOULD extend under hair.
@@ -1819,7 +2461,7 @@ def _run_cpu_geometric_pipeline(
                 face_only_mask = cv2.bitwise_or(face_only_mask, parsing[pkey])
         # Minimal neck band
         face_m = parsing.get("face")
-        if face_m is not None:
+        if face_m is not None and garment_category != "dress":
             face_ys = np.where(face_m > 0)[0]
             if len(face_ys) > 5:
                 neck_skin_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 10))
@@ -1828,10 +2470,13 @@ def _run_cpu_geometric_pipeline(
                 face_only_mask = cv2.bitwise_or(face_only_mask, neck_skin)
         face_only_mask = cv2.dilate(face_only_mask, np.ones((3, 3), np.uint8), iterations=1)
 
+    composite_mask = dress_body_support_mask.copy() if garment_category == "dress" else warped_mask.copy()
     if face_only_mask.sum() > 0:
-        warped_mask = cv2.subtract(warped_mask, face_only_mask)
+        composite_mask = cv2.subtract(composite_mask, face_only_mask)
+        if garment_category != "dress":
+            warped_mask = composite_mask
 
-    _debug_save("06a_warped_mask_after_protect", warped_mask, is_mask=True)
+    _debug_save("06a_warped_mask_after_protect", composite_mask, is_mask=True)
 
     # v16.7e: Edge blur DISABLED — was creating halo band.
     # Diffusion will handle edge smoothing naturally.
@@ -1852,17 +2497,18 @@ def _run_cpu_geometric_pipeline(
     # appears SOLID on the person, not ghost/translucent. Tops still need a
     # soft feather for natural sleeve edge.
     if garment_category == "dress":
-        # v16.29: Slightly softer warp edge (sigma 0.6 -> 1.4) so the warp/print
-        # transition into diffusion is gradient, not a hard cut. The wider
-        # diffusion ring below will fully cover this feather, eliminating any
-        # visible seam at neck / waist / sleeve boundary.
-        # v16.46: Increase feather (sigma 1.4 -> 2.6, erode 1 -> 2) so the
-        # garment edge fades gently into skin/background instead of looking
-        # like a sharp cutout pasted on top of the person.
-        torso_soft = _soft_mask(warped_mask, blur_sigma=2.6, erode_px=2)
+        dress_core = (composite_mask > 48).astype(np.uint8) * 255
+        dress_core = cv2.morphologyEx(
+            dress_core, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), iterations=1,
+        )
+        torso_soft = cv2.GaussianBlur(
+            dress_core.astype(np.float32) / 255.0, (3, 3), 0.6,
+        )
+        torso_soft[torso_soft < 0.35] = 0.0
+        torso_soft = np.clip(torso_soft, 0.0, 1.0)
         pipeline_info.append("HardDressMask")
     else:
-        torso_soft = _soft_mask(warped_mask, blur_sigma=1.2, erode_px=2)
+        torso_soft = _soft_mask(composite_mask, blur_sigma=1.2, erode_px=2)
     _debug_save("06_torso_mask", (torso_soft * 255).astype(np.uint8), is_mask=True)
     torso_alpha = torso_soft[..., None]
 
@@ -1871,6 +2517,7 @@ def _run_cpu_geometric_pipeline(
         + warped_cloth_matched.astype(np.float32) * torso_alpha
     )
     init_tryon = _safe_uint8(init_tryon)
+    visible_alpha = torso_soft.copy()
 
     # Layer 2+3: SLEEVES (v16: tighter seam ring)
     # v16: 3x3 dilate (was 5x5) and (5,5) blur (was 7,7) — narrower seam band
@@ -1880,22 +2527,42 @@ def _run_cpu_geometric_pipeline(
     seam_f = cv2.GaussianBlur(
         seam_ring.astype(np.float32) / 255.0, (5, 5), 1.0,
     )
+    dress_body_texture_valid = None
+    if garment_category == "dress":
+        dress_body_texture_valid = _garment_texture_valid_mask(
+            warped_cloth_matched,
+            dress_body_support_mask,
+        )
 
     for side in ("left", "right"):
         if side not in sleeve_data:
             continue
         s_rgb, s_mask_f = sleeve_data[side]
 
-        # v15: Trap gray-border artifacts in sleeve RGB.
-        # The sleeve warp fills non-sleeve areas with (128,128,128) gray.
-        # If the mask bleeds slightly, these gray pixels blend in → dark patches.
-        # Replace near-gray pixels inside the mask with nearest cloth colors.
-        s_bright = s_rgb.astype(np.float32).sum(axis=2)
-        gray_leak = (s_mask_f > 0.1) & (np.abs(s_bright - 384.0) < 30.0)  # 128*3=384
-        if gray_leak.sum() > 10:
-            s_blurred = cv2.GaussianBlur(s_rgb, (11, 11), 3.0)
-            s_rgb = s_rgb.copy()
-            s_rgb[gray_leak] = s_blurred[gray_leak]
+        # Sleeve warp uses neutral gray outside the source sleeve.  When the
+        # target sleeve mask is wider than the narrow source strip, that gray
+        # gets composited as "background stuck to the dress".  Fill every
+        # masked sleeve pixel from nearest real sleeve texture first.
+        s_target = (s_mask_f > 0.05).astype(np.uint8) * 255
+        s_valid = _garment_texture_valid_mask(s_rgb, s_target)
+        s_rgb, s_row_fill = _repeat_row_texture_into_mask(s_rgb, s_target, s_valid)
+        s_rgb = _propagate_texture_into_mask(s_rgb, s_target, s_valid | s_row_fill, max_iter=90)
+        if garment_category == "dress" and dress_body_texture_valid is not None:
+            body_sleeve_rgb, body_sleeve_fill = _repeat_row_texture_into_mask(
+                warped_cloth_matched,
+                s_target,
+                dress_body_texture_valid,
+            )
+            body_sleeve_rgb = _propagate_texture_into_mask(
+                body_sleeve_rgb,
+                s_target,
+                dress_body_texture_valid | body_sleeve_fill,
+                max_iter=90,
+            )
+            s_detail = _garment_texture_valid_mask(s_rgb, s_target)
+            replace_flat = (s_target > 0) & ~s_detail
+            if int(replace_flat.sum()) > 20:
+                s_rgb[replace_flat] = body_sleeve_rgb[replace_flat]
 
         # Remove torso overlap from sleeve mask (sleeve only outside torso)
         s_exclusive = np.clip(s_mask_f - torso_soft, 0.0, 1.0)
@@ -1904,11 +2571,20 @@ def _run_cpu_geometric_pipeline(
         s_in_seam = np.minimum(s_mask_f, seam_f) * 0.6
         s_final = np.clip(s_exclusive + s_in_seam, 0.0, 1.0)
 
-        # Soft edge: gaussian blur the final sleeve alpha for anti-aliasing
+        # Soft edge: gaussian blur the final sleeve alpha for anti-aliasing.
+        # Dresses need a harder sleeve alpha because the underlayer has already
+        # erased old sleeve pixels; low alpha shows that neutral fill as grey.
         s_final_u8 = (s_final * 255).clip(0, 255).astype(np.uint8)
-        s_final = cv2.GaussianBlur(
-            s_final_u8.astype(np.float32) / 255.0, (5, 5), 1.0,
-        )
+        if garment_category == "dress":
+            s_final = cv2.GaussianBlur(
+                s_final_u8.astype(np.float32) / 255.0, (3, 3), 0.6,
+            )
+            s_final[s_final < 0.12] = 0.0
+            s_final = np.clip(s_final * 1.18, 0.0, 0.98)
+        else:
+            s_final = cv2.GaussianBlur(
+                s_final_u8.astype(np.float32) / 255.0, (5, 5), 1.0,
+            )
 
         s_alpha = s_final[..., None]
         init_tryon = (
@@ -1916,9 +2592,25 @@ def _run_cpu_geometric_pipeline(
             + s_rgb.astype(np.float32) * s_alpha
         )
         init_tryon = _safe_uint8(init_tryon)
+        visible_alpha = np.maximum(visible_alpha, s_final)
         _debug_save(f"06_after_sleeve_{side}", init_tryon)
 
     pipeline_info.append("3LayerBlend")
+
+    if garment_category == "dress":
+        visible_u8 = (visible_alpha > 0.08).astype(np.uint8) * 255
+        visible_guard = cv2.dilate(visible_u8, np.ones((5, 5), np.uint8), iterations=1)
+        restore_bg = cv2.subtract(erase_mask, visible_guard)
+        if int(restore_bg.sum()) > 255 * 50:
+            restore_f = cv2.GaussianBlur(
+                (restore_bg > 20).astype(np.float32), (7, 7), 2.0
+            )[..., None]
+            restore_f = np.clip(restore_f, 0.0, 1.0)
+            init_tryon = _safe_uint8(
+                init_tryon.astype(np.float32) * (1.0 - restore_f)
+                + person_rgb.astype(np.float32) * restore_f
+            )
+            pipeline_info.append("EraseRestore:v16.61")
 
     # ── Step 7b: Shoulder-zone soft blend — DISABLED v16.7d ──
     # ShoulderSmooth was blurring the garment at shoulder boundaries.
@@ -1933,12 +2625,13 @@ def _run_cpu_geometric_pipeline(
     init_tryon = np.clip(init_tryon, 10, 245).astype(np.uint8)
 
     # Update warped_mask to include sleeve coverage for downstream steps
-    wm_garment = (warped_mask > 20).astype(np.uint8) * 255
+    wm_garment = (composite_mask > 20).astype(np.uint8) * 255
     for side in sleeve_data:
         s_rgb, s_mask_f = sleeve_data[side]
         sleeve_uint8 = (s_mask_f * 255).clip(0, 255).astype(np.uint8)
         wm_garment = cv2.bitwise_or(wm_garment, sleeve_uint8)
     warped_mask = wm_garment
+    warped_mask_full = cv2.bitwise_or(warped_mask_full, wm_garment)
 
     # ── Step 8: Layer foreground on top ──
     # Two-pass overlay:
@@ -1948,11 +2641,13 @@ def _run_cpu_geometric_pipeline(
     # hair disappears where it overlaps garment → unnatural.
     if parsing:
         # Pass 1: Arms + face (NOT hair)
-        # v16.41: For dress, paste arms back only where the garment/sleeve mask
-        # does NOT cover them. This removes gray erase-fill columns while still
-        # keeping real dress sleeves on top where they exist.
+        # v16.24: For DRESS, DO NOT paste arms back — dress sleeves must cover
+        # the upper arms. Pasting person_rgb arms on top of the 3LayerBlend
+        # result re-introduces bare skin + old-shirt pixels, which diffusion
+        # then only partially overwrites (strength 0.55) → ghost/translucent
+        # dress with skin bleed. Only keep face/hat/sunglasses for dress.
         if garment_category == "dress":
-            _fg_keys = ("left_arm", "right_arm", "face", "hat", "sunglasses")
+            _fg_keys = ("face", "hat", "sunglasses")
         else:
             _fg_keys = ("left_arm", "right_arm", "face", "hat", "sunglasses")
         arm_face_mask = np.zeros((h_out, w_out), dtype=np.uint8)
@@ -1971,20 +2666,7 @@ def _run_cpu_geometric_pipeline(
 
         # Pass 2: Hair overlay — ALWAYS on top, no sleeve_protect subtraction.
         # v16.9c: Erode hair mask to only paste core hair, avoid old-shirt bleed at edges.
-        hair_mask = parsing.get("hair")
-        if hair_mask is not None and hair_mask.sum() > 0:
-            # Erode to keep only confident hair pixels (no uncertain boundary pixels)
-            hair_core = cv2.erode(hair_mask, np.ones((3, 3), np.uint8), iterations=1)
-            hair_alpha = cv2.GaussianBlur(
-                hair_core.astype(np.float32) / 255.0, (7, 7), 2.0
-            )[..., None]
-
-            init_tryon = _safe_uint8(
-                init_tryon.astype(np.float32) * (1.0 - hair_alpha)
-                + person_rgb.astype(np.float32) * hair_alpha
-            )
-
-        pipeline_info.append("Layers")
+        init_tryon, _ = _paste_original_hair_layer(init_tryon, person_rgb, parsing)
 
     # ── Restore exposed arm skin for short sleeves ──
     # v16.24: SKIP for dress — dress sleeves cover the arms, we don't want to
@@ -2082,44 +2764,31 @@ def _run_local_diffusion_refinement(
                         "upper_clothes", "dress", "left_arm", "right_arm")
 
     elif garment_category == "dress":
-        # v16.50: IDM/CatVTON-style dress agnostic mask. For dress/overall
-        # try-on, modern pipelines mask a broad changeable region (old upper
-        # clothes, skirt/pants/legs, arms/neck) and protect only identity parts
-        # such as face/hair/shoes/hands. Our previous seam-only mask preserved
-        # print, but left DressFullErase's skin/grey fill visible outside the
-        # warped dress -> the output looked layered. Keep the dress core locked
-        # by subtracting dress_core, but let diffusion refill the surrounding
-        # changeable region as a single visible garment layer.
-        # v16.52: Shrink dress_outer dilation from 19 -> 5 px so diffusion does
-        # NOT paint a wider dress silhouette beyond the actual warp footprint.
-        # Previously the 19-px outward ring produced a second outer dress shape
-        # surrounding the locked CPU core ("two layers" artifact). Keep the
-        # core lock tight (erode 9) so most of the warp interior is preserved
-        # but the seam ring is thin and entirely on top of the warp.
-        dress_bin = (warped_mask > 20).astype(np.uint8) * 255
-        dress_core = cv2.erode(dress_bin, np.ones((9, 9), np.uint8), iterations=1)
-        dress_outer = cv2.dilate(dress_bin, np.ones((5, 5), np.uint8), iterations=1)
-        gen_mask = cv2.subtract(dress_outer, dress_core)
+        # v16.55: Generate dress like the TOP path: inpaint the FULL garment
+        # footprint instead of only a narrow edge ring. The ring-only v16.53
+        # avoided the duplicate layer, but it left the TPS warp almost intact,
+        # so the result looked pasted on. Here diffusion owns the full warped
+        # dress+sleeve mask and can add body-following folds/shading, while the
+        # final DressSingleLayerClip still prevents pixels outside the footprint
+        # from becoming a second dress.
+        gen_mask = binary_mask.copy()
+        gen_mask = cv2.morphologyEx(gen_mask, cv2.MORPH_CLOSE,
+                                    np.ones((7, 7), np.uint8))
+        gen_mask = cv2.dilate(gen_mask, np.ones((5, 5), np.uint8), iterations=1)
+
+        # Keep neckline/collar cleanup close to the garment only. This mirrors
+        # the top path's natural transition without adding arms/legs/skirt as a
+        # broad separate dress silhouette.
         if parsing:
-            old_clothes = get_clothing_mask(parsing)
-            if old_clothes is not None:
-                old_clothes = cv2.subtract(old_clothes, dress_core)
-                gen_mask = cv2.bitwise_or(gen_mask, old_clothes)
             neck_diff = get_neck_mask(parsing)
             if neck_diff is not None:
-                gen_mask = cv2.bitwise_or(gen_mask, neck_diff)
-            for _dk in (
-                "dress", "coat", "scarf", "pants", "skirt",
-                "left_leg", "right_leg", "left_arm", "right_arm",
-            ):
-                _dm = parsing.get(_dk)
-                if _dm is not None:
-                    _dm = cv2.subtract(_dm, dress_core)
-                    gen_mask = cv2.bitwise_or(gen_mask, _dm)
-        # PROTECT: face/hair/hat/sunglasses/shoes. Do not protect pants/legs
-        # for dress: DressCode/IDM treat them as changeable for dresses.
-        # Dress core is not protected here because it has already been removed
-        # from gen_mask.
+                near_garment = cv2.dilate(binary_mask, np.ones((17, 17), np.uint8), iterations=1)
+                gen_mask = cv2.bitwise_or(gen_mask, cv2.bitwise_and(neck_diff, near_garment))
+        pipeline_info.append("DressFullGenMask:v16.55")
+
+        # Do not protect arms for dress: if sleeve warp produced sleeve mask,
+        # arms inside binary_mask are part of the generated garment. Regions
+        # outside binary_mask are restored after diffusion.
         protect_keys = ("face", "hair", "hat", "sunglasses",
                         "left_shoe", "right_shoe")
 
@@ -2137,19 +2806,8 @@ def _run_local_diffusion_refinement(
                         "pants", "skirt", "left_leg", "right_leg",
                         "left_shoe", "right_shoe")
 
-    if garment_category == "dress":
-        # v16.52: tighten dilation from 13 -> 3 so any old-clothes/arm regions
-        # added to gen_mask only get a thin seam ring, not a wide repaint band
-        # that would extend beyond the warp and create an outer ghost dress.
-        gen_mask = cv2.dilate(gen_mask, np.ones((3, 3), np.uint8), iterations=1)
-        # Re-subtract the dress core so the central pattern stays from CPU warp.
-        gen_mask = cv2.subtract(gen_mask, dress_core)
-        # v16.52: HARD CLIP gen_mask to the dress_outer (warp + 5px). This
-        # guarantees diffusion never paints dress fabric outside the warp
-        # footprint, eliminating the second-layer halo. Old shirt residue
-        # outside the warp is handled by DressFullErase's skin fill instead.
-        gen_mask = cv2.bitwise_and(gen_mask, dress_outer)
-    else:
+    # Dilate mask (dress already dilated above with larger kernel)
+    if garment_category != "dress":
         gen_mask = cv2.dilate(gen_mask, np.ones((21, 21), np.uint8), iterations=1)
 
     # Apply protection mask
@@ -2158,28 +2816,6 @@ def _run_local_diffusion_refinement(
         for pkey in protect_keys:
             if pkey in parsing:
                 protect_mask = cv2.bitwise_or(protect_mask, parsing[pkey])
-        if garment_category == "dress":
-            # v16.50: IDM/CatVTON protect hands while masking arms for sleeves.
-            # Our parser does not expose separate hand labels, so approximate
-            # them as the lower/distal end of each arm component. This keeps
-            # fingers/skin from being repainted while still allowing sleeve
-            # fabric to cover the upper/mid arm.
-            _hand_protect = np.zeros((h, w), dtype=np.uint8)
-            for _ak in ("left_arm", "right_arm"):
-                _am = parsing.get(_ak)
-                if _am is None or int(_am.sum()) < 255 * 30:
-                    continue
-                _ays, _axs = np.where(_am > 0)
-                if len(_ays) < 30:
-                    continue
-                _cut_y = int(np.percentile(_ays, 78))
-                _distal = np.zeros((h, w), dtype=np.uint8)
-                _distal[(_am > 0) & (np.indices((h, w))[0] >= _cut_y)] = 255
-                _distal = cv2.dilate(_distal, np.ones((5, 5), np.uint8), iterations=1)
-                _hand_protect = cv2.bitwise_or(_hand_protect, _distal)
-            if int(_hand_protect.sum()) > 0:
-                protect_mask = cv2.bitwise_or(protect_mask, _hand_protect)
-                pipeline_info.append("HandProtect")
         protect_mask = cv2.dilate(protect_mask, np.ones((5, 5), np.uint8), iterations=1)
         gen_mask = cv2.subtract(gen_mask, protect_mask)
 
@@ -2201,13 +2837,28 @@ def _run_local_diffusion_refinement(
     # v16.12b: Also save a CLEAN copy of init_tryon before any pre-fill mutation;
     # DressBlend uses this as the "ground truth" garment to preserve pattern.
     init_tryon_clean = init_tryon.copy()
+    diffusion_mode = (refiner_mode or "lcm").strip().lower()
+    if diffusion_mode not in {"lcm", "hypersd", "dpm++", "euler", "base"}:
+        diffusion_mode = "lcm"
+    if (
+        garment_category == "dress"
+        and diffusion_mode in {"lcm", "hypersd"}
+        and os.getenv("VTON_DRESS_FAST_REFINER", "0").strip() != "1"
+    ):
+        diffusion_mode = "dpm++"
+        pipeline_info.append("DressQualityDPM:v17.2")
+
     if garment_category == "dress":
-        # v16.45: stronger seam/agnostic pass so diffusion can extend the
-        # dress fabric into the grey erase ring around the warp (old shirt
-        # silhouette). The dress core is still locked by DressLightMerge so
-        # the leopard print is preserved; this pass only refills the gap.
-        _diff_strength = 0.55
-        _diff_guidance = 3.5
+        # v17.3: Keep dress diffusion real, but stop asking SD to redesign the
+        # garment.  DPM++ fp32 now generates correctly; high strength/guidance
+        # made it invent a new dress print instead of adding folds to the seed.
+        _preserve = float(np.clip(preserve_strength, 0.25, 1.0))
+        if diffusion_mode in {"dpm++", "euler", "base"}:
+            _diff_strength = float(np.clip(0.76 - 0.10 * _preserve, 0.62, 0.74))
+            _diff_guidance = 3.2
+        else:
+            _diff_strength = float(np.clip(0.72 - 0.08 * _preserve, 0.60, 0.70))
+            _diff_guidance = 3.6
         # Extract dominant dress colour from TPS torso region
         _dress_region = binary_mask > 127
         _dress_color = np.array([128, 128, 128], dtype=np.float32)
@@ -2249,14 +2900,21 @@ def _run_local_diffusion_refinement(
                             return "navy" if b < 170 else "blue"
                         return "tan"
                     _anchor = f"{_name(_q_dark)} and {_name(_q_light)} {_name(_q_mid)}"
-                    # v16.39: DON'T override style_prompt at all. The user-
-                    # provided prompt (or empty) is best. Adding 'fitted
-                    # dress' / colour hints made LCM bias toward generic
-                    # dress samples and destroyed the leopard print. Just
-                    # log the anchor for debug; keep prompt as user gave it.
+                    # Do not call the dress "leopard". That token makes SD
+                    # redraw round spots.  Anchor the exact source dress and
+                    # ask only for fold/lighting changes.
+                    style_prompt = (
+                        f"same exact source dress on the person, preserve the original {_anchor} abstract print and color layout, "
+                        f"do not redesign the dress, natural body-following fabric folds, soft waist drape, "
+                        f"subtle sleeve wrinkles, clean shoulders neckline, crisp hem"
+                    ).strip(", ")
                     print(f"[DIFFUSION] Dress colour anchor: {_anchor}")
             except Exception:
-                pass
+                style_prompt = (
+                    "same exact source dress on the person, preserve the original black beige abstract print and color layout, "
+                    "do not redesign the dress, natural body-following fabric folds, soft waist drape, "
+                    "subtle sleeve wrinkles, clean shoulders neckline, crisp hem"
+                )
 
         # v16.18b: SKIP tile pre-fill and color-stat nudge for dress.
         # With HardDressMask + DressFullErase, init_tryon already contains the
@@ -2281,21 +2939,41 @@ def _run_local_diffusion_refinement(
         except Exception:
             _env_infer = 0
         _infer_size = _env_infer if (garment_category == "dress" and _env_infer >= 512) else 0
+        if garment_category == "dress" and diffusion_mode in {"lcm", "hypersd"}:
+            _infer_steps = int(np.clip(gen_steps, 10, 14))
+        elif garment_category == "dress" and diffusion_mode in {"dpm++", "euler", "base"}:
+            _infer_steps = int(np.clip(max(gen_steps, 24), 22, 30))
+        else:
+            _infer_steps = max(gen_steps, 20)
+        diffusion_init = init_tryon
+        if garment_category == "dress":
+            diffusion_init = _build_dress_diffusion_seed(init_tryon, gen_mask_soft, binary_mask)
+            _debug_save("09b_dress_diffusion_seed", diffusion_init)
         generated = generate_tryon_image(
-            init_tryon_rgb=init_tryon,
+            init_tryon_rgb=diffusion_init,
             inpaint_mask_gray=gen_mask_soft,
             user_prompt=style_prompt,
             config=GenConfig(
-                num_inference_steps=max(gen_steps, 20),
+                num_inference_steps=_infer_steps,
                 guidance_scale=_diff_guidance,
-                refiner_mode="lcm",
-                cloth_type=cloth_type,
-                # v16.40b: Dress LoRA overpowers complex prints and pulls the
-                # result toward generic dress samples. Keep LoRA for tops /
-                # pants, but let dress follow the init warp.
+                refiner_mode=diffusion_mode,
+                cloth_type="dress" if garment_category == "dress" else cloth_type,
                 use_cloth_lora=(garment_category != "dress"),
                 strength=_diff_strength,
                 infer_size=_infer_size,
+                negative_prompt=(
+                    "logo, text, graphic, animal face, different dress, changed print, "
+                    "leopard spots, spotted print, polka dots, dalmatian print, round spots, "
+                    "new pattern, geometric panels, vertical panels, diagonal panels, triangular panels, "
+                    "metallic panels, color block panels, glossy satin, armor, eyes, redesigned dress, "
+                    "plain fabric, inner dress, second dress, double layer, inner panel, "
+                    "shoulder pads, puffy shoulders, bulky shoulders, cape shoulders, "
+                    "duplicate sleeves, extra sleeves, pasted sleeves, arm overlay, bare arm under sleeve, old red sleeve, "
+                    "cinched waist, tight waist, belt, sash, old red shirt, "
+                    "shorts visible, transparent skirt, missing skirt, open skirt, "
+                    "old clothing visible, cpu warp, geometric warp, flat pasted cloth, sticker effect, no folds, "
+                    "vertical streaks, scratched texture, torn fabric, grey patch, blurry, low quality, bad anatomy"
+                ) if garment_category == "dress" else GenConfig().negative_prompt,
             ),
         )
 
@@ -2303,6 +2981,11 @@ def _run_local_diffusion_refinement(
         generated = _sanitize_rgb_output(generated)
         generated = _fit_like(generated, init_tryon, is_mask=False)
         binary_mask = _fit_like(binary_mask, generated, is_mask=True)
+        if garment_category == "dress":
+            _debug_save("10a_dress_model_raw", generated)
+            generated = _apply_color_consistency(generated, init_tryon_clean, binary_mask, strength=0.16)
+            generated = _restore_dress_print_detail(generated, init_tryon_clean, binary_mask, detail_strength=0.62)
+            _debug_save("10b_dress_detail_restored", generated)
 
         # Blackout guard
         mean_val = float(generated.mean())
@@ -2315,40 +2998,6 @@ def _run_local_diffusion_refinement(
             warning_msg = "Diffusion unstable, keeping CPU result"
             print(f"[DIFFUSION] SOFT-FAIL — blackout artifact detected")
             return init_tryon, "", warning_msg, pipeline_info
-
-        if garment_category == "dress":
-            # v16.43: DressLightMerge fixes the CPU-warp vs diffusion double
-            # composite loop. gen_tryon.py already composites diffusion over
-            # init_tryon; then DressCoreLock previously pasted CPU warp back at
-            # 0.88, erasing most visible GPU changes. For dress, keep CPU warp
-            # as the single colour/print source, transfer only luminance from
-            # diffusion over the garment core. For the agnostic gap OUTSIDE the
-            # warped dress, use diffusion RGB strongly; otherwise the skin/grey
-            # DressFullErase underlayer remains visible as a second layer.
-            _core_lock = cv2.erode(binary_mask, np.ones((17, 17), np.uint8), iterations=1)
-            _edge_mask = cv2.subtract(gen_mask_soft, _core_lock)
-            _edge_alpha = cv2.GaussianBlur((_edge_mask > 20).astype(np.float32), (9, 9), 3.0)[..., None]
-            _edge_alpha = np.clip(_edge_alpha * 0.35, 0.0, 0.35)
-
-            # v16.51: Disable broad RGB gap fill. It removed grey fill, but it
-            # also synthesized a second translucent dress layer around the real
-            # warped dress. Keep RGB diffusion only on the narrow seam band;
-            # final single-layer clipping below removes any outer generated
-            # residue after DrapeLightPass.
-            _merge_alpha = _edge_alpha
-
-            _light_base = _blend_luminance_from_diffusion(
-                init_tryon_clean,
-                generated,
-                binary_mask,
-                strength=0.72,
-                broad_strength=0.32,
-            )
-            generated = _safe_uint8(
-                _light_base.astype(np.float32) * (1.0 - _merge_alpha)
-                + generated.astype(np.float32) * _merge_alpha
-            )
-            pipeline_info.append("DressLightMerge")
 
         # Brightness guard — blend CPU garment back if too dark
         _garment_region = binary_mask > 127
@@ -2367,108 +3016,28 @@ def _run_local_diffusion_refinement(
         # with person_rgb would overwrite the CPU garment with old shirt pixels.
         # The diffusion output (generated) already has correct compositing from gen_tryon.
         output = generated
-
-        # v16.42: GPU DrapeLightPass. Previous FoldPass directly accepted the
-        # diffusion RGB and could repaint leopard into zebra. This pass still
-        # asks GPU for natural folds, but only transfers medium-frequency
-        # luminance (shadows/highlights) back onto the locked CPU/diffusion
-        # result. Colour + print remain from the original warped dress.
         if garment_category == "dress":
-            try:
-                _fold_mask = cv2.erode(binary_mask, np.ones((5, 5), np.uint8), iterations=1)
-                if parsing:
-                    _ps = np.zeros(_fold_mask.shape, dtype=np.uint8)
-                    for _sk in (
-                        "upper_clothes", "dress", "coat", "scarf",
-                        "left_arm", "right_arm", "neck",
-                        "pants", "skirt", "left_leg", "right_leg",
-                    ):
-                        _sv = parsing.get(_sk)
-                        if _sv is not None:
-                            _ps = cv2.bitwise_or(_ps, _sv)
-                    if int(_ps.sum()) > 255 * 500:
-                        _ps = cv2.morphologyEx(_ps, cv2.MORPH_CLOSE,
-                                               np.ones((15, 15), np.uint8))
-                        _ps = cv2.erode(_ps, np.ones((3, 3), np.uint8), iterations=1)
-                        _fold_mask = cv2.bitwise_and(_fold_mask, _ps)
-                _protect = np.zeros(_fold_mask.shape, dtype=np.uint8)
-                if parsing:
-                    for _pk in ("face", "hair", "hat", "sunglasses",
-                                "left_shoe", "right_shoe"):
-                        _pv = parsing.get(_pk)
-                        if _pv is not None:
-                            _protect = cv2.bitwise_or(_protect, _pv)
-                    _protect = cv2.dilate(_protect, np.ones((5, 5), np.uint8), iterations=1)
-                _fold_mask = cv2.subtract(_fold_mask, _protect)
-                _fold_mask_soft = cv2.GaussianBlur(_fold_mask,
-                                                   (blur_k, blur_k),
-                                                   blur_k / 3.0)
-                _fold_mask_soft = np.clip(_fold_mask_soft, 0, 255).astype(np.uint8)
-                _debug_save("09b_drape_light_mask", _fold_mask_soft, is_mask=True)
-
-                if int((_fold_mask_soft > 30).sum()) > 500:
-                    _fold_prompt = (
-                        "same dress on body, realistic vertical fabric folds, "
-                        "soft waist drape, hip shadows, natural cloth wrinkles, "
-                        "clean neckline, no text, no logo"
-                    )
-                    fold_out = generate_tryon_image(
-                        init_tryon_rgb=output,
-                        inpaint_mask_gray=_fold_mask_soft,
-                        user_prompt=_fold_prompt,
-                        config=GenConfig(
-                            num_inference_steps=14,
-                            guidance_scale=3.0,
-                            refiner_mode="lcm",
-                            cloth_type="dress",
-                            use_cloth_lora=False,
-                            strength=0.50,
-                            infer_size=_infer_size,
-                        ),
-                    )
-                    fold_out = _sanitize_rgb_output(fold_out)
-                    fold_out = _fit_like(fold_out, output, is_mask=False)
-                    if float(fold_out.mean()) > 20 and not _is_blackout_artifact(fold_out, output, binary_mask):
-                        output = _blend_luminance_from_diffusion(
-                            output,
-                            fold_out,
-                            _fold_mask_soft,
-                            strength=0.78,
-                            broad_strength=0.42,
-                        )
-                        pipeline_info.append("DrapeLightPass")
-                        print(f"[DIFFUSION] DRAPE LIGHT PASS done, mean={float(output.mean()):.1f}")
-            except Exception as _fold_exc:
-                print(f"[DIFFUSION] DrapeLightPass skipped: {_fold_exc}")
-
-        if garment_category == "dress":
-            # v16.52: Single visible dress layer. Aggressively clip every
-            # diffusion-generated pixel outside the actual warp footprint back
-            # to the clean CPU composite. Reduced dilation 7 -> 2 px so the
-            # outer dress halo (caused by diffusion painting beyond the warp)
-            # is entirely removed.
-            _visible = cv2.dilate(binary_mask, np.ones((3, 3), np.uint8), iterations=1)
-            _visible = cv2.GaussianBlur((_visible > 20).astype(np.float32), (5, 5), 1.2)[..., None]
-            _visible = np.clip(_visible, 0.0, 1.0)
-            output = _safe_uint8(
-                init_tryon_clean.astype(np.float32) * (1.0 - _visible)
-                + output.astype(np.float32) * _visible
-            )
-            # Restore identity/skin regions outside the single dress layer so
-            # hands/arms/face do not keep diffusion residue.
-            if parsing:
-                _restore = np.zeros(binary_mask.shape, dtype=np.uint8)
-                for _rk in ("face", "hair", "hat", "sunglasses", "left_arm", "right_arm"):
-                    _rv = parsing.get(_rk)
-                    if _rv is not None:
-                        _restore = cv2.bitwise_or(_restore, _rv)
-                _restore = cv2.subtract(_restore, cv2.dilate(binary_mask, np.ones((5, 5), np.uint8), iterations=1))
-                _restore_f = cv2.GaussianBlur((_restore > 20).astype(np.float32), (7, 7), 2.0)[..., None]
-                output = _safe_uint8(
-                    output.astype(np.float32) * (1.0 - _restore_f)
-                    + person_rgb.astype(np.float32) * _restore_f
+            _debug_save("10_dress_diffusion_raw", generated)
+            if os.getenv("VTON_DRESS_DIFFUSION_PRIMARY", "0").strip() == "1":
+                output = generated.copy()
+                pipeline_info.append("DressDiffusionPrimaryOptIn:v17.4")
+            else:
+                output = _apply_dress_gpu_refine_layer(
+                    init_tryon_clean,
+                    generated,
+                    binary_mask,
+                    strength=float(np.clip(preserve_strength, 0.25, 1.0)),
                 )
-            pipeline_info.append("DressSingleLayerClip:v16.52")
+                output = _restore_dress_crisp_source_texture(
+                    output,
+                    init_tryon_clean,
+                    binary_mask,
+                    detail_strength=0.92,
+                    chroma_strength=0.94,
+                )
+                _debug_save("10c_dress_gpu_light_refine", output)
+                pipeline_info.append("DressGpuLightRefine:v17.5")
+                pipeline_info.append("DressCrispTexture:v17.5")
 
         # v16.17: DressShapeLock REMOVED. The previous post-blend of 45% TPS
         # onto diffusion was re-introducing red/pink bleed because
@@ -2477,21 +3046,128 @@ def _run_local_diffusion_refinement(
         # body erase + neutral grey fill, diffusion already receives a clean
         # init — output is the final answer.
         if garment_category == "dress":
-            pipeline_info.append("DressGen")
-
-        # v16.23: Expose GPU/CPU status so user can verify from the UI.
-        try:
-            import torch as _torch_dbg
-            _is_cuda = _torch_dbg.cuda.is_available()
-            pipeline_info.append(f"Diffusion[{'GPU' if _is_cuda else 'CPU'}]")
-        except Exception:
-            pipeline_info.append("Diffusion")
+            # v16.53 DressSingleLayerClip: Hard-clip diffusion output OUTSIDE
+            # the warp footprint back to the CPU init. Even with a tightened
+            # gen_mask, LCM can leak dress pixels into adjacent regions via
+            # the soft-mask repaint. Restoring init_tryon outside binary_mask
+            # guarantees only ONE visible dress layer (the warp) and removes
+            # any second/ghost dress silhouette behind it.
+            try:
+                _wm_u8 = (binary_mask > 20).astype(np.uint8) * 255
+                _wm_clip = cv2.dilate(_wm_u8, np.ones((3, 3), np.uint8), iterations=1)
+                _wm_alpha = cv2.GaussianBlur(
+                    (_wm_clip > 20).astype(np.float32), (5, 5), 1.2
+                )[..., None]
+                _wm_alpha = np.clip(_wm_alpha, 0.0, 1.0)
+                output = _safe_uint8(
+                    init_tryon_clean.astype(np.float32) * (1.0 - _wm_alpha)
+                    + output.astype(np.float32) * _wm_alpha
+                )
+                # Restore identity regions (face/hair/arms) from person_rgb so
+                # any diffusion residue on skin is removed.
+                if parsing:
+                    _restore = np.zeros(_wm_u8.shape, dtype=np.uint8)
+                    for _rk in ("face", "hair", "hat", "sunglasses",
+                                "left_arm", "right_arm"):
+                        _rv = parsing.get(_rk)
+                        if _rv is not None:
+                            _restore = cv2.bitwise_or(_restore, _rv)
+                    _restore = cv2.subtract(
+                        _restore,
+                        cv2.dilate(_wm_u8, np.ones((5, 5), np.uint8), iterations=1),
+                    )
+                    _rf = cv2.GaussianBlur(
+                        (_restore > 20).astype(np.float32), (7, 7), 2.0
+                    )[..., None]
+                    output = _safe_uint8(
+                        output.astype(np.float32) * (1.0 - _rf)
+                        + person_rgb.astype(np.float32) * _rf
+                    )
+                pipeline_info.append("DressSingleLayerClip:v16.53")
+            except Exception as _clip_exc:
+                print(f"[DIFFUSION] DressSingleLayerClip skipped: {_clip_exc}")
+            _red_cleanup_mask = cv2.dilate(binary_mask, np.ones((11, 11), np.uint8), iterations=1)
+            if parsing:
+                _old_clothes_for_red = get_clothing_mask(parsing)
+                if _old_clothes_for_red is not None:
+                    _near_garment = cv2.dilate(binary_mask, np.ones((25, 25), np.uint8), iterations=1)
+                    _red_cleanup_mask = cv2.bitwise_or(
+                        _red_cleanup_mask,
+                        cv2.bitwise_and(_old_clothes_for_red, _near_garment),
+                    )
+            output, _red_fixed = _inpaint_old_red_bleed(output, _red_cleanup_mask, parsing)
+            if _red_fixed:
+                pipeline_info.append("DressRedBleedInpaint:v16.67")
+            output, _collar_fixed = _remove_old_collar_bleed(output, init_tryon_clean, binary_mask)
+            if _collar_fixed:
+                pipeline_info.append("DressCollarClean:v16.62")
+            output = _suppress_dress_edge_halo(output, person_rgb, binary_mask)
+            pipeline_info.append("DressDehalo:v16.59")
         print(f"[DIFFUSION] SUCCESS — SOTA agnostic mask, mean_brightness={float(output.mean()):.1f}")
-        return output, "Local Diffusion (lcm)", warning_msg, pipeline_info
+        return output, f"Local Diffusion ({diffusion_mode})", warning_msg, pipeline_info
     except (RuntimeError, Exception) as exc:
         warning_msg = f"Local diffusion failed, keeping CPU pipeline result. ({exc})"
         print(f"[DIFFUSION] FAILED — {exc}")
         return init_tryon, "", warning_msg, pipeline_info
+
+
+def _compact_pipeline_info(pipeline_info: list[str]) -> list[str]:
+    """Return a stable, user-facing pipeline summary.
+
+    Internal pipeline_info contains many historical debug tags (v16/v17).  The
+    UI only needs major stages so regressions are still visible without making
+    the pipeline look like dozens of separate products are stacked together.
+    """
+    compact: list[str] = []
+    seen: set[str] = set()
+
+    def add(label: str | None) -> None:
+        if not label or label in seen:
+            return
+        compact.append(label)
+        seen.add(label)
+
+    for item in pipeline_info:
+        if not item:
+            continue
+        if item in {
+            "SoftErase", "BodyCopy:OFF", "Sleeves", "Layers", "DressGen",
+            "Diffusion", "DrapeHint", "DressNeckUnprotect:v16.62",
+            "DressDehaloCPU:v16.61",
+        }:
+            continue
+        if item.startswith("Diffusion["):
+            continue
+        if item.startswith("Type:") or item.startswith("Trans:"):
+            continue
+        if item.startswith("Category:"):
+            add(item)
+        elif item in {"Parsing", "Pose", "Pose(basic)", "U2Net", "MaskFallback", "PreFit", "CloudVTON", "CloudFailed"}:
+            add(item)
+        elif item.startswith(("Affine", "TPS", "Persp", "HipAlign", "ShoulderAlign", "RotAlign", "DriftFix")):
+            add("Warp")
+        elif item.startswith(("DressSleevePoseClip", "DressSkirtComplete", "DressBodyPoseFit", "DressShoulderSeal")):
+            add("DressFit")
+        elif item in {"ArmErase", "NeckErase", "SleeveErase"} or item.startswith(("DressEraseClip", "DressFullErase")):
+            add("DressErase")
+        elif item.startswith(("DressTextureFill", "HardDressMask", "3LayerBlend", "EraseRestore")):
+            add("DressComposite")
+        elif item.startswith("DressFullGenMask"):
+            add("DiffusionMask")
+        elif item.startswith(("DressFastLCM", "DressDiffusionPrimary", "DressCpuTextureOptIn")):
+            add("DressDiffusion")
+        elif item.startswith("DressSingleLayerClip"):
+            add("SingleLayerClip")
+        elif item.startswith(("DressRedBleedInpaint", "DressCollarClean", "DressDehalo", "DressPostHairRedClean", "HairRestoreAfterClean")):
+            add("Cleanup")
+        elif item == "HairOverlay":
+            add("HairOverlay")
+        elif item in {"FacePreserve", "ColorMatch"}:
+            add(item)
+        else:
+            add(item)
+
+    return compact or pipeline_info
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -2539,19 +3215,41 @@ def try_on(
     output = None
     parsing = None  # Set by CPU path; may be None if cloud succeeds
     warped_mask = None  # Set by CPU path; used by HairOverlay
+    garment_category = None
+
+    cloud_cloth_type = "upper"
+    try:
+        cloud_mask = build_cloth_mask(cloth_rgb)
+        garment_category = detect_garment_category(cloud_mask)
+        if garment_category == "dress":
+            cloud_cloth_type = "overall"
+        elif garment_category == "pants":
+            cloud_cloth_type = "lower"
+    except Exception:
+        garment_category = None
+        cloud_cloth_type = "upper"
 
     # ═══ PATH A: CLOUD-PRIMARY (default when use_gen=True) ═══
     # Send raw person + cloth images directly to cloud API.
     # No CPU preprocessing needed — cloud handles everything.
-    if use_gen:
+    if use_gen and use_catvton_cloud:
         try:
+            cloud_style_prompt = (style_prompt or "").strip()
+            if not cloud_style_prompt:
+                if cloud_cloth_type == "overall":
+                    cloud_style_prompt = "a realistic full-body dress matching the garment reference"
+                elif cloud_cloth_type == "lower":
+                    cloud_style_prompt = "realistic lower-body clothing matching the garment reference"
+                else:
+                    cloud_style_prompt = "a realistic top garment matching the garment reference"
             cloud_result_path, cloud_backend = generate_with_cloud_router(
                 person_image_path=person_path,
                 cloth_image_path=cloth_path,
-                style_prompt=style_prompt,
+                style_prompt=cloud_style_prompt,
                 steps=int(gen_steps),
                 guidance=float(min(gen_guidance, 7.5)),
                 seed=random.randint(0, 10000),
+                cloth_type=cloud_cloth_type,
             )
             cloud_rgb = read_image_rgb(cloud_result_path)
 
@@ -2584,7 +3282,12 @@ def try_on(
             for info_item in cpu_info:
                 if info_item.startswith("Type:"):
                     _stype = info_item.split(":")[1]
-                    if _stype == "short":
+                    if garment_category == "dress":
+                        if _stype == "short":
+                            _sleeve_hint = "short sleeve dress, "
+                        elif _stype == "long":
+                            _sleeve_hint = "long sleeve dress, "
+                    elif _stype == "short":
                         _sleeve_hint = "cap sleeve top, preserve cap-sleeve silhouette, "
                     elif _stype == "long":
                         _sleeve_hint = "long sleeves shirt, preserve long sleeve shape, "
@@ -2616,33 +3319,59 @@ def try_on(
     # Paste person_rgb's hair on top. Use erode (not dilate) to keep ONLY core hair
     # pixels and avoid old-shirt bleedthrough at the hair-garment boundary.
     if parsing and "hair" in parsing:
-        _hair_raw = parsing["hair"]
-        # ERODE 2px to remove uncertain edge pixels where old shirt might leak
-        _hair_core = cv2.erode(_hair_raw, np.ones((3, 3), np.uint8), iterations=1)
-        # Soft edge: blur the eroded mask for natural transition
-        _hair_alpha = cv2.GaussianBlur(
-            _hair_core.astype(np.float32) / 255.0, (7, 7), 2.0
-        )[..., None]
-
-        # Direct paste: person_rgb hair onto output (which has garment under hair)
-        output = _safe_uint8(
-            output.astype(np.float32) * (1.0 - _hair_alpha)
-            + person_rgb.astype(np.float32) * _hair_alpha
-        )
+        output, _ = _paste_original_hair_layer(output, person_rgb, parsing)
         pipeline_info.append("HairOverlay")
+
+        if (
+            garment_category == "dress"
+            and warped_mask is not None
+            and os.getenv("VTON_POST_HAIR_RED_CLEAN", "0").strip() == "1"
+        ):
+            _post_red_mask = cv2.dilate(
+                (warped_mask > 20).astype(np.uint8) * 255,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25)),
+                iterations=1,
+            )
+            _old_upper = get_clothing_mask(parsing)
+            if _old_upper is not None:
+                _post_red_mask = cv2.bitwise_or(
+                    _post_red_mask,
+                    cv2.bitwise_and(
+                        _old_upper,
+                        cv2.dilate(_post_red_mask, np.ones((7, 7), np.uint8), iterations=1),
+                    ),
+                )
+            output, _post_red_fixed = _inpaint_old_red_bleed(
+                output,
+                _post_red_mask,
+                parsing,
+                protect_hair=True,
+                allow_large_upper=False,
+            )
+            if _post_red_fixed:
+                pipeline_info.append("DressPostHairRedClean:v16.70")
+                output, _hair_restored_after_clean = _paste_original_hair_layer(output, person_rgb, parsing)
+                if _hair_restored_after_clean:
+                    pipeline_info.append("HairRestoreAfterClean:v16.72")
 
     # ═══ SAVE & RETURN ═══
     output = _safe_uint8(output)
     output_file = storage.outputs_dir / f"tryon_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
     save_image_rgb(output_file, output)
 
+    mode_label = (
+        "Cloud+Refine"
+        if use_gen and use_catvton_cloud
+        else ("Local Diffusion" if use_gen else "CPU only")
+    )
+    public_pipeline_info = _compact_pipeline_info(pipeline_info)
     info = (
         f"Saved: {output_file}\n"
         f"Storage base: {storage.base_dir}\n"
-        f"Mode: {'Cloud+Refine' if use_gen else 'CPU only'}\n"
+        f"Mode: {mode_label}\n"
         f"Backend: {backend_used}\n"
         f"Preset: {quality_preset}\n"
-        f"Pipeline: {' -> '.join(pipeline_info)}\n"
+        f"Pipeline: {' -> '.join(public_pipeline_info)}\n"
     )
 
     if warning_msg:

@@ -231,8 +231,12 @@ def generate_with_cloud_router(
     steps: int,
     guidance: float,
     seed: int,
+    cloth_type: str = "upper",
 ) -> tuple[Path, str]:
     errors: list[str] = []
+    cloth_type = (cloth_type or "upper").strip().lower()
+    if cloth_type not in {"upper", "lower", "overall"}:
+        cloth_type = "upper"
 
     # Tier 1: CatVTON (fastest, free HF Spaces, multi-space failover)
     try:
@@ -242,7 +246,7 @@ def generate_with_cloud_router(
             steps=steps,
             guidance=guidance,
             seed=seed,
-            cloth_type="upper",
+            cloth_type=cloth_type,
         ), "CatVTON Cloud"
     except CloudVTONUnavailableError as exc:
         errors.append(str(exc))

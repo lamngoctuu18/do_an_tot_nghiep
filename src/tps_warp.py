@@ -1561,339 +1561,6 @@ def refine_warped_mask(mask: np.ndarray) -> np.ndarray:
     return mask
 
 
-# ── Body-fit dress warp (v16.47) ──────────────────────────────────────
-
-def body_fit_warp_dress(
-    cloth_rgb: np.ndarray,
-    cloth_mask: np.ndarray,
-    pose: dict[str, tuple[int, int]],
-    output_shape: tuple[int, int],
-) -> tuple[np.ndarray, np.ndarray]:
-    """Per-row body-fit warp for dresses.
-
-    Maps the dress shape onto the person using anchored bands:
-        neckline -> person neck (shoulders mid-point, ~12% torso above)
-        shoulder line -> person shoulders
-        waist line -> person waist (interpolated from shoulder+hip)
-        hip line -> person hips
-        hem -> person ankles (or canvas bottom)
-
-    Vertical mapping is piecewise-linear between those anchors. Horizontal
-    scaling at every output row is set by interpolating the target body
-    width at that y. Below the hip the skirt KEEPS the original dress's
-    flare (preserving its cloth_width(row) / cloth_width(hip_row) ratio)
-    so a tapered bodycon stays tapered, and an A-line keeps flaring.
-    """
-    # v16.49: BodyFitSafe. The original v16.47 implementation remapped both X
-    # and Y from cloth rows to body rows. That fit the landmarks, but for dense
-    # vertical/animal prints it stretched texture into barcode-like columns.
-    # Use the stable dress affine as the base, then only apply a gentle
-    # horizontal per-row body fit around neck/shoulder/waist/hip. Vertical
-    # texture flow stays untouched, so prints remain natural.
-    base_cloth, base_mask = simple_affine_warp_cloth(
-        cloth_rgb=cloth_rgb,
-        cloth_mask=cloth_mask,
-        pose=pose,
-        output_shape=output_shape,
-        garment_category="dress",
-    )
-
-    h_out, w_out = output_shape
-    ys_base, xs_base = np.where(base_mask > 20)
-    if len(xs_base) < 200:
-        return base_cloth, base_mask
-
-    try:
-        ls = np.array(pose["left_shoulder"], dtype=np.float64)
-        rs = np.array(pose["right_shoulder"], dtype=np.float64)
-        lh = np.array(pose["left_hip"], dtype=np.float64)
-        rh = np.array(pose["right_hip"], dtype=np.float64)
-    except Exception:
-        return base_cloth, base_mask
-
-    person_sh_y = float((ls[1] + rs[1]) * 0.5)
-    person_hip_y = float((lh[1] + rh[1]) * 0.5)
-    person_torso_h = max(20.0, person_hip_y - person_sh_y)
-    person_neck_y = person_sh_y - person_torso_h * 0.12
-    person_waist_y = person_sh_y + person_torso_h * 0.55
-    person_sh_w = float(np.linalg.norm(ls - rs))
-    person_hip_w = float(abs(rh[0] - lh[0]))
-    if person_hip_w < person_sh_w * 0.6:
-        person_hip_w = person_sh_w * 0.95
-
-    la = pose.get("left_ankle") or pose.get("left_knee")
-    ra = pose.get("right_ankle") or pose.get("right_knee")
-    if la and ra:
-        person_hem_y = float((la[1] + ra[1]) * 0.5)
-    else:
-        person_hem_y = person_sh_y + person_torso_h * 2.8
-    person_hem_y = float(min(h_out - 2, max(person_hem_y, person_hip_y + person_torso_h * 0.4)))
-
-    target_y = np.array([person_neck_y, person_sh_y, person_waist_y, person_hip_y, person_hem_y], dtype=np.float64)
-    target_w = np.array([
-        person_sh_w * 0.58,
-        person_sh_w * 1.08,
-        max(person_sh_w, person_hip_w) * 0.92,
-        person_hip_w * 1.12,
-        person_hip_w * 1.06,
-    ], dtype=np.float64)
-    top_cx = float((ls[0] + rs[0]) * 0.5)
-    hip_cx = float((lh[0] + rh[0]) * 0.5)
-    target_cx = np.array([top_cx, top_cx, (top_cx + hip_cx) * 0.5, hip_cx, hip_cx], dtype=np.float64)
-
-    row_left = np.full(h_out, np.nan, dtype=np.float64)
-    row_right = np.full(h_out, np.nan, dtype=np.float64)
-    for row in range(max(0, int(ys_base.min())), min(h_out, int(ys_base.max()) + 1)):
-        nz = np.where(base_mask[row] > 20)[0]
-        if len(nz) > 3:
-            row_left[row] = float(nz[0])
-            row_right[row] = float(nz[-1])
-
-    valid = ~np.isnan(row_left)
-    if valid.sum() < 20:
-        return base_cloth, base_mask
-    valid_idx = np.where(valid)[0]
-    for arr in (row_left, row_right):
-        arr[:valid_idx[0]] = arr[valid_idx[0]]
-        arr[valid_idx[-1] + 1:] = arr[valid_idx[-1]]
-        missing = np.isnan(arr)
-        if missing.any():
-            good = np.where(~missing)[0]
-            arr[missing] = np.interp(np.where(missing)[0], good, arr[good])
-
-    current_w = np.maximum(1.0, row_right - row_left)
-    current_cx = (row_left + row_right) * 0.5
-    rows = np.arange(h_out, dtype=np.float64)
-    desired_w = np.interp(rows, target_y, target_w)
-    desired_cx = np.interp(rows, target_y, target_cx)
-
-    # Limit each row to small changes. This keeps body fitting visible but
-    # avoids texture tearing and column artifacts on patterned dresses.
-    scale_x = np.clip(desired_w / current_w, 0.88, 1.12)
-    cx_shift = np.clip(desired_cx - current_cx, -10.0, 10.0)
-    fit_mask = np.zeros(h_out, dtype=np.float32)
-    y_top = max(0, int(person_neck_y - 4))
-    y_bot = min(h_out - 1, int(person_hem_y + 4))
-    fit_mask[y_top:y_bot + 1] = 1.0
-    fit_mask = cv2.GaussianBlur(fit_mask.reshape(-1, 1), (1, max(21, (h_out // 12) | 1)), 0).ravel()
-    scale_x = 1.0 + (scale_x - 1.0) * fit_mask
-    target_row_cx = current_cx + cx_shift * fit_mask
-
-    yy, xx = np.mgrid[0:h_out, 0:w_out].astype(np.float32)
-    map_x = (current_cx[:, None] + (xx - target_row_cx[:, None]) / scale_x[:, None]).astype(np.float32)
-    map_y = yy.astype(np.float32)
-
-    warped_cloth = cv2.remap(
-        base_cloth, map_x, map_y,
-        interpolation=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_REPLICATE,
-    )
-    warped_mask = cv2.remap(
-        base_mask, map_x, map_y,
-        interpolation=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT, borderValue=0,
-    )
-    warped_mask = refine_warped_mask(warped_mask)
-    return warped_cloth, warped_mask
-
-    cloth_rgb = _prepare_cloth_for_warp(cloth_rgb, cloth_mask)
-    h_out, w_out = output_shape
-
-    ys, xs = np.where(cloth_mask > 0)
-    if len(xs) < 200:
-        return np.zeros((h_out, w_out, 3), dtype=np.uint8), np.zeros((h_out, w_out), dtype=np.uint8)
-
-    y1, y2 = int(ys.min()), int(ys.max())
-    x1, x2 = int(xs.min()), int(xs.max())
-    cloth_h = max(1, y2 - y1)
-    cloth_w = max(1, x2 - x1)
-
-    # Per-row left/right edges of cloth (smoothed)
-    left_edge = np.full(cloth_mask.shape[0], np.nan, dtype=np.float64)
-    right_edge = np.full(cloth_mask.shape[0], np.nan, dtype=np.float64)
-    for r in range(y1, y2 + 1):
-        nz = np.where(cloth_mask[r] > 0)[0]
-        if len(nz) > 2:
-            left_edge[r] = float(nz[0])
-            right_edge[r] = float(nz[-1])
-    # Forward-fill nan with nearest valid (rare edge holes)
-    valid = ~np.isnan(left_edge)
-    if valid.sum() < 5:
-        return np.zeros((h_out, w_out, 3), dtype=np.uint8), np.zeros((h_out, w_out), dtype=np.uint8)
-    valid_idx = np.where(valid)[0]
-    for arr in (left_edge, right_edge):
-        first_v, last_v = valid_idx[0], valid_idx[-1]
-        arr[:first_v] = arr[first_v]
-        arr[last_v + 1:] = arr[last_v]
-        nan_mask = np.isnan(arr)
-        if nan_mask.any():
-            good = np.where(~nan_mask)[0]
-            arr[nan_mask] = np.interp(np.where(nan_mask)[0], good, arr[good])
-
-    # Smooth edges to remove jitter — use a larger kernel (3% cloth height)
-    # so that irregular silhouettes don't create per-row scale oscillations.
-    sm_kernel = max(9, int(cloth_h * 0.03) | 1)
-    left_edge = cv2.GaussianBlur(left_edge.reshape(-1, 1), (1, sm_kernel), 0).ravel()
-    right_edge = cv2.GaussianBlur(right_edge.reshape(-1, 1), (1, sm_kernel), 0).ravel()
-    cloth_row_w = np.maximum(1.0, right_edge - left_edge)
-    cloth_row_cx = (left_edge + right_edge) * 0.5
-
-    # Cloth landmark rows
-    cy_neck = y1 + int(cloth_h * 0.02)
-    # Shoulder = widest row in top 30%
-    top30_end = min(cloth_mask.shape[0] - 1, y1 + int(cloth_h * 0.30))
-    sh_row = int(y1 + np.argmax(cloth_row_w[y1:top30_end + 1]))
-    cloth_shoulder_w = float(cloth_row_w[sh_row])
-    # Waist = narrowest row between sh_row and 65%
-    waist_search_a = sh_row + int(cloth_h * 0.10)
-    waist_search_b = y1 + int(cloth_h * 0.55)
-    if waist_search_b > waist_search_a + 5:
-        waist_row = int(waist_search_a + np.argmin(cloth_row_w[waist_search_a:waist_search_b + 1]))
-    else:
-        waist_row = sh_row + int(cloth_h * 0.30)
-    cloth_waist_w = float(cloth_row_w[waist_row])
-    # Hip = widest row in 45-80%
-    hip_search_a = y1 + int(cloth_h * 0.40)
-    hip_search_b = y1 + int(cloth_h * 0.78)
-    if hip_search_b > hip_search_a + 5:
-        hip_row = int(hip_search_a + np.argmax(cloth_row_w[hip_search_a:hip_search_b + 1]))
-    else:
-        hip_row = y1 + int(cloth_h * 0.55)
-    cloth_hip_w = float(cloth_row_w[hip_row])
-    hem_row = y2
-
-    # Body landmarks
-    ls = np.array(pose["left_shoulder"], dtype=np.float64)
-    rs = np.array(pose["right_shoulder"], dtype=np.float64)
-    lh = np.array(pose["left_hip"], dtype=np.float64)
-    rh = np.array(pose["right_hip"], dtype=np.float64)
-
-    person_sh_y = float((ls[1] + rs[1]) * 0.5)
-    person_hip_y = float((lh[1] + rh[1]) * 0.5)
-    person_torso_h = max(20.0, person_hip_y - person_sh_y)
-    person_cx_top = float((ls[0] + rs[0]) * 0.5)
-    person_cx_hip = float((lh[0] + rh[0]) * 0.5)
-
-    person_sh_w = float(np.linalg.norm(ls - rs))
-    person_hip_w = float(abs(rh[0] - lh[0]))
-    if person_hip_w < person_sh_w * 0.6:
-        person_hip_w = person_sh_w * 0.95  # fallback if hip detection bad
-
-    # Waist y ~ 55% between shoulders and hips, width ~ min(sh,hip)*0.88
-    person_waist_y = person_sh_y + person_torso_h * 0.55
-    person_waist_w = max(person_sh_w, person_hip_w) * 0.88
-    person_neck_y = person_sh_y - person_torso_h * 0.12
-
-    la = pose.get("left_ankle") or pose.get("left_knee")
-    ra = pose.get("right_ankle") or pose.get("right_knee")
-    if la and ra:
-        person_ankle_y = float((la[1] + ra[1]) * 0.5)
-    else:
-        person_ankle_y = person_sh_y + person_torso_h * 2.8
-    person_hem_y = float(min(h_out - 2, person_ankle_y))
-    person_hem_y = max(person_hem_y, person_hip_y + person_torso_h * 0.4)
-
-    # Target widths at body landmarks (with small margins)
-    tw_neck = person_sh_w * 0.55
-    tw_shoulder = person_sh_w * 1.10
-    tw_waist = person_waist_w * 1.05
-    tw_hip = person_hip_w * 1.18
-
-    # Cloth-y -> person-y piecewise-linear anchors
-    cloth_anchors_y = np.array([cy_neck, sh_row, waist_row, hip_row, hem_row], dtype=np.float64)
-    body_anchors_y = np.array([person_neck_y, person_sh_y, person_waist_y, person_hip_y, person_hem_y], dtype=np.float64)
-    body_anchors_cx = np.array([
-        person_cx_top, person_cx_top,
-        (person_cx_top + person_cx_hip) * 0.5,
-        person_cx_hip, person_cx_hip,
-    ], dtype=np.float64)
-
-    # Per cloth-row -> target body row & target width & target center
-    cloth_rows = np.arange(cloth_mask.shape[0], dtype=np.float64)
-    body_rows = np.interp(cloth_rows, cloth_anchors_y, body_anchors_y)
-    body_cx_per_row = np.interp(cloth_rows, cloth_anchors_y, body_anchors_cx)
-
-    # Target width: piecewise. For rows below hip_row, preserve original
-    # cloth flare ratio so the skirt silhouette stays faithful to the source.
-    target_w = np.zeros_like(cloth_rows)
-    sh_w_list = np.array([tw_neck, tw_shoulder, tw_waist, tw_hip], dtype=np.float64)
-    sh_y_list = cloth_anchors_y[:4]
-    upper = cloth_rows <= hip_row
-    target_w[upper] = np.interp(cloth_rows[upper], sh_y_list, sh_w_list)
-    lower = ~upper
-    if lower.any():
-        # Below hip: scale with cloth row width relative to hip row width.
-        ratio = cloth_row_w[lower.nonzero()[0].clip(0, cloth_mask.shape[0] - 1)]
-        ratio = ratio / max(1.0, cloth_hip_w)
-        target_w[lower] = tw_hip * ratio
-
-    # Build remap: for each output pixel (Y, X), find the cloth source row r
-    # whose body_rows[r] == Y, then linearly map X across the row.
-    # Invert body_rows (monotone increasing) -> cloth_row at given body_y.
-    body_rows_full = body_rows[y1:y2 + 1]
-    cloth_rows_full = cloth_rows[y1:y2 + 1]
-    sort_idx = np.argsort(body_rows_full)
-    body_sorted = body_rows_full[sort_idx]
-    cloth_sorted = cloth_rows_full[sort_idx]
-
-    yy, xx = np.mgrid[0:h_out, 0:w_out].astype(np.float32)
-    # For each output y, the source cloth row r:
-    src_r = np.interp(yy[:, 0], body_sorted, cloth_sorted)
-    src_r_int = np.clip(src_r.astype(np.int32), y1, y2)
-
-    # Per-output-row centers and scales
-    target_w_row = target_w[src_r_int]
-    body_cx_row = body_cx_per_row[src_r_int]
-    cloth_w_row = cloth_row_w[src_r_int]
-    cloth_cx_row = cloth_row_cx[src_r_int]
-
-    scale_x_row = np.clip(target_w_row / np.maximum(cloth_w_row, 1.0), 0.4, 4.0)
-
-    # v16.48: Smooth per-row parameters to eliminate stripe/banding artifacts.
-    # Abrupt scale or center changes between adjacent rows create visible
-    # horizontal bands and vertical distortion in patterned fabrics (e.g. animal print).
-    # Gaussian smoothing makes width/center transitions gradual → natural drape.
-    _sm_k = max(11, (h_out // 15) | 1)  # ~7% of canvas height, always odd
-
-    def _smooth1d(a: np.ndarray) -> np.ndarray:
-        return cv2.GaussianBlur(
-            a.astype(np.float32).reshape(-1, 1), (1, _sm_k), 0
-        ).ravel()
-
-    scale_x_row = np.clip(_smooth1d(scale_x_row), 0.4, 4.0)
-    body_cx_row = _smooth1d(body_cx_row)
-    cloth_cx_row = _smooth1d(cloth_cx_row)
-
-    # map_x[y, x] = cloth_cx_row[y] + (x - body_cx_row[y]) / scale_x_row[y]
-    body_cx_2d = body_cx_row[:, None]
-    cloth_cx_2d = cloth_cx_row[:, None]
-    scale_2d = scale_x_row[:, None]
-    map_x = (cloth_cx_2d + (xx - body_cx_2d) / scale_2d).astype(np.float32)
-    map_y = np.broadcast_to(src_r[:, None], (h_out, w_out)).astype(np.float32)
-
-    warped_cloth = cv2.remap(
-        cloth_rgb, map_x, map_y,
-        interpolation=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_REPLICATE,
-    )
-    warped_mask = cv2.remap(
-        cloth_mask, map_x, map_y,
-        interpolation=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT, borderValue=0,
-    )
-
-    # Restrict mask to the rendered dress vertical band (between neck and hem
-    # on the person) to avoid stray edge replication outside.
-    vbottom = int(min(h_out - 1, person_hem_y + 4))
-    vtop = int(max(0, person_neck_y - 4))
-    band = np.zeros_like(warped_mask)
-    band[vtop:vbottom + 1, :] = 255
-    warped_mask = cv2.bitwise_and(warped_mask, band)
-
-    warped_mask = refine_warped_mask(warped_mask)
-    return warped_cloth, warped_mask
-
-
 # ── Body-scaled fallback (when TPS fails) ─────────────────────────────
 
 def simple_affine_warp_cloth(
@@ -2001,15 +1668,13 @@ def simple_affine_warp_cloth(
 
     # Separate width and height scaling
     if cloth_shoulder_w > 10:
-        # v16.31: For dress, scale width by MAX(shoulder, hip)*1.18 instead of
-        # shoulder*1.05. Flat-lay dresses have a tapered waist; scaling only
-        # by shoulder makes the on-body waist look pinched (narrower than the
-        # actual hips). Using the wider of shoulder/hip plus a +18% margin
-        # gives a fuller, more natural waist/hip silhouette.
         if garment_category == "dress":
+            # v16.56: Dresses must cover both shoulder and hip form. Scaling
+            # only from shoulder width leaves a straight, pasted-looking tube
+            # on wider hips; use the larger body reference with a small margin.
             person_hip_w = float(abs(rh[0] - lh[0]))
             person_ref_w = max(person_sw, person_hip_w)
-            scale_w = (person_ref_w * 1.18) / cloth_shoulder_w
+            scale_w = (person_ref_w * 1.10) / cloth_shoulder_w
         else:
             scale_w = (person_sw * 1.05) / cloth_shoulder_w
     else:
@@ -2212,15 +1877,19 @@ def _warp_long_sleeve_tps(
     if M_aff is None:
         return None, None
 
-    # Prepare sleeve-only cloth image
-    sleeve_cloth = cloth_prepared.copy()
-    sleeve_cloth[side_mask == 0] = 128  # neutral gray outside sleeve
+    # Prepare sleeve-only cloth image without neutral gray.  The warped sleeve
+    # mask is soft, so any constant 128 background can leak into visible pixels.
+    sleeve_cloth = _prepare_cloth_for_warp(cloth_prepared, side_mask)
+    sleeve_pixels = cloth_prepared[side_mask > 0]
+    sleeve_bg = (128, 128, 128)
+    if len(sleeve_pixels) > 20:
+        sleeve_bg = tuple(int(v) for v in np.median(sleeve_pixels, axis=0))
 
     # Affine warp
     aligned_s = cv2.warpAffine(
         sleeve_cloth, M_aff, (w_out, h_out),
         flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT, borderValue=(128, 128, 128),
+        borderMode=cv2.BORDER_CONSTANT, borderValue=sleeve_bg,
     )
     aligned_sm = cv2.warpAffine(
         side_mask, M_aff, (w_out, h_out),
@@ -2259,7 +1928,7 @@ def _warp_long_sleeve_tps(
         aligned_s = cv2.remap(
             aligned_s, map_x, map_y,
             interpolation=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT, borderValue=(128, 128, 128),
+            borderMode=cv2.BORDER_CONSTANT, borderValue=sleeve_bg,
         )
         aligned_sm = cv2.remap(
             aligned_sm.astype(np.float32), map_x, map_y,
@@ -2461,13 +2130,16 @@ def warp_sleeves_to_arms(
         M_rot[0, 2] += person_sh[0] - cloth_sh_pt[0]
         M_rot[1, 2] += person_sh[1] - cloth_sh_pt[1]
 
-        sleeve_cloth = cloth_prepared.copy()
-        sleeve_cloth[side_mask == 0] = 128
+        sleeve_cloth = _prepare_cloth_for_warp(cloth_prepared, side_mask)
+        sleeve_pixels = cloth_prepared[side_mask > 0]
+        sleeve_bg = (128, 128, 128)
+        if len(sleeve_pixels) > 20:
+            sleeve_bg = tuple(int(v) for v in np.median(sleeve_pixels, axis=0))
 
         warped_s = cv2.warpAffine(
             sleeve_cloth, M_rot, (w_out, h_out),
             flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT, borderValue=(128, 128, 128),
+            borderMode=cv2.BORDER_CONSTANT, borderValue=sleeve_bg,
         )
         warped_sm = cv2.warpAffine(
             side_mask, M_rot, (w_out, h_out),

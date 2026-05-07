@@ -39,7 +39,7 @@ def _ensure_model() -> bool:
             SegformerForSemanticSegmentation,
         )
         cache_dir = os.getenv("HF_HUB_CACHE") or os.getenv("HUGGINGFACE_HUB_CACHE")
-        print("[human_parsing] Downloading SegFormer model (first time only)…")
+        print("[human_parsing] Downloading SegFormer model (first time only)...")
         _processor = SegformerImageProcessor.from_pretrained(
             "mattmdjaga/segformer_b2_clothes",
             cache_dir=cache_dir,
@@ -50,7 +50,7 @@ def _ensure_model() -> bool:
         )
         _model.eval()
         _ready = True
-        print("[human_parsing] Model loaded ✓")
+        print("[human_parsing] Model loaded")
     except Exception as exc:
         print(f"[human_parsing] Could not load model: {exc}")
         _ready = False

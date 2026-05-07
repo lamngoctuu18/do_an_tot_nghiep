@@ -1,9 +1,9 @@
 import { useParams, Link } from "react-router-dom";
 import { useState, useRef, useCallback } from "react";
-import { Upload, Shirt, Loader2, ArrowLeft, RotateCcw, Download, Settings, ChevronDown, ChevronUp, Cloud, Cpu, Zap } from "lucide-react";
+import { Upload, Shirt, Loader2, ArrowLeft, RotateCcw, Download, Settings, ChevronDown, ChevronUp, Cloud, Cpu } from "lucide-react";
 import { products } from "../data/products";
 
-type EngineMode = "cloud" | "local" | "cpu";
+type EngineMode = "cloud" | "local";
 
 export default function TryOn() {
   const { id } = useParams();
@@ -19,7 +19,7 @@ export default function TryOn() {
   const [status, setStatus] = useState<string>("");
   const [showSettings, setShowSettings] = useState(false);
 
-  // Engine mode: cloud (default), local (SD-inpaint), cpu (geometric only)
+  // Engine mode: cloud (default) or local SD diffusion.
   const [engineMode, setEngineMode] = useState<EngineMode>("cloud");
 
   // Pipeline settings (matching Gradio UI)
@@ -30,7 +30,7 @@ export default function TryOn() {
   const [genSteps, setGenSteps] = useState(20);
   const [genGuidance, setGenGuidance] = useState(2.5);
   const [preserveStrength, setPreserveStrength] = useState(0.60);
-  const [qualityPreset, setQualityPreset] = useState<"fast" | "balanced" | "hq">("hq");
+  const [qualityPreset, setQualityPreset] = useState<"fast" | "balanced" | "hq">("balanced");
   const [refinerMode, setRefinerMode] = useState("dpm++");
   const [clothType, setClothType] = useState("auto");
 
@@ -75,14 +75,12 @@ export default function TryOn() {
     setResult(null);
     setBackendBadge("");
 
-    const useGen = engineMode !== "cpu";
+    const useGen = true;
     const useCatvtonCloud = engineMode === "cloud";
 
     const statusMsg = engineMode === "cloud"
       ? "Sending to Cloud AI (IDM-VTON / CatVTON)..."
-      : engineMode === "local"
-        ? "Processing with local SD-Inpaint..."
-        : "Running CPU geometric pipeline...";
+      : "Processing with local SD-Inpaint...";
     setStatus(statusMsg);
 
     try {
@@ -217,22 +215,10 @@ export default function TryOn() {
             <Cpu className="w-4 h-4" />
             Local SD
           </button>
-          <button
-            onClick={() => setEngineMode("cpu")}
-            className={`flex items-center gap-2 px-5 py-3 rounded-xl text-sm font-medium transition-all ${
-              engineMode === "cpu"
-                ? "bg-primary text-white shadow-lg shadow-primary/25"
-                : "bg-surface-light text-gray-400 hover:text-white"
-            }`}
-          >
-            <Zap className="w-4 h-4" />
-            CPU Only
-          </button>
         </div>
         <p className="text-xs text-gray-600 mt-2 text-center">
           {engineMode === "cloud" && "IDM-VTON / CatVTON / Fal.ai — best quality, needs internet (30-90s)"}
           {engineMode === "local" && "Stable Diffusion inpaint — offline, needs GPU 4-6GB (15-60s)"}
-          {engineMode === "cpu" && "Geometric warp only — fastest, no GPU needed (5-15s)"}
         </p>
       </div>
 
@@ -327,7 +313,7 @@ export default function TryOn() {
                   <Loader2 className="w-10 h-10 text-primary animate-spin mx-auto mb-3" />
                   <p className="text-sm text-gray-400">{status || "Dang xu ly AI..."}</p>
                   <p className="text-xs text-gray-600 mt-1">
-                    {engineMode === "cloud" ? "Cloud: 30-90s" : engineMode === "local" ? "Local: 15-60s" : "CPU: 5-15s"}
+                    {engineMode === "cloud" ? "Cloud: 30-90s" : "Local: 15-60s"}
                   </p>
                 </div>
               ) : (
@@ -430,9 +416,8 @@ export default function TryOn() {
               className="w-full px-4 py-2.5 bg-surface-light border border-white/10 rounded-xl text-sm text-white placeholder:text-gray-600 focus:outline-none focus:border-primary/50" />
           </label>
 
-          {/* Row 4: Diffusion params (visible when NOT cpu mode) */}
-          {engineMode !== "cpu" && (
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 p-4 bg-surface-light/50 rounded-xl border border-white/5">
+          {/* Row 4: Diffusion params */}
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 p-4 bg-surface-light/50 rounded-xl border border-white/5">
               <label className="space-y-1">
                 <span className="text-sm text-gray-400">Refine steps ({genSteps})</span>
                 <input type="range" min={4} max={30} step={1} value={genSteps}
@@ -454,8 +439,7 @@ export default function TryOn() {
                   className="w-full accent-primary" />
                 <div className="flex justify-between text-xs text-gray-600"><span>0.25</span><span>1.00</span></div>
               </label>
-            </div>
-          )}
+          </div>
 
           {/* Row 5: Dropdowns */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -485,7 +469,7 @@ export default function TryOn() {
           </div>
 
           <p className="text-xs text-gray-600">
-            Tip: Cloud AI cho ket qua tot nhat. Local SD can GPU 4-6GB. CPU mode nhanh nhat nhung chat luong thap.
+            Tip: Cloud AI cho ket qua tot nhat. Local SD dung GPU + diffusion de giu nep gap va duong net tu nhien hon.
           </p>
         </div>
       )}

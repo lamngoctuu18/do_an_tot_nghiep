@@ -23,21 +23,12 @@ class GenConfig:
     strength: float = 0.82  # v16.10e: folds without destroying sleeve shape
     cloth_type: str = "auto"
     use_cloth_lora: bool = True
-    # v16.13: Allow callers to request higher inference resolution on GPU for
-    # higher-fidelity generation (e.g. dress with complex prints like leopard).
-    # 0 (default) => use legacy 512 square on GPU. On CPU we always clamp to 512.
-    infer_size: int = 0
+    infer_size: int = 0  # 0 = auto (512); set to 640/768 for higher-res dress inference
     negative_prompt: str = (
         "deformed garment, wrinkled mess, wrong sleeve length, sleeveless, "
         "distorted fabric, pasted on, flat texture, sticker effect, "
         "deformed body, duplicate arms, bad anatomy, blurry, low quality, artifacts, "
-        "multiple garments, layered clothing, old clothing visible, "
-        "color shift, rainbow pattern, tie dye, wrong color, altered print, "
-        "red trim, red collar, red cuffs, red border, red neckline, red hem, "
-        "contrast collar, contrast cuffs, two-tone garment, "
-        "handbag, purse, bag, clutch, tote, satchel, backpack, "
-        "accessories, jewelry, necklace, scarf, belt, hat, gloves, "
-        "extra objects, holding items, props, logo, text, watermark"
+        "multiple garments, layered clothing, old clothing visible"
     )
 
 
@@ -49,10 +40,26 @@ def _to_pil_mask(mask_gray: np.ndarray) -> Image.Image:
     return Image.fromarray(mask_gray.astype(np.uint8), mode="L")
 
 
+def _patch_huggingface_cached_download() -> None:
+    """Compat for older diffusers with newer huggingface_hub."""
+    try:
+        import huggingface_hub as _hf_hub
+        if hasattr(_hf_hub, "cached_download"):
+            return
+
+        def _cached_download(*args, **kwargs):
+            return _hf_hub.hf_hub_download(*args, **kwargs)
+
+        _hf_hub.cached_download = _cached_download
+    except Exception:
+        return
+
+
 @lru_cache(maxsize=1)
 def _get_pipeline(refiner_mode: str):
     try:
         import torch
+        _patch_huggingface_cached_download()
         from diffusers import LCMScheduler, StableDiffusionInpaintPipeline
     except ImportError as exc:
         raise RuntimeError(
@@ -93,9 +100,16 @@ def _get_pipeline(refiner_mode: str):
                 use_safetensors=True,
                 **common_kwargs,
             )
-        # Cast entire pipeline to fp32 to avoid NaN in UNet
-        pipe = pipe.to(dtype=torch.float32)
-        print("[gen_tryon] Loaded fp16 safetensors → cast to fp32 (NaN-safe, no .bin needed)")
+        force_fp32 = (
+            os.getenv("VTON_FORCE_FP32", "0").strip() == "1"
+            or refiner_mode in {"dpm++", "euler", "base"}
+        )
+        if force_fp32:
+            pipe = pipe.to(dtype=torch.float32)
+            print(f"[gen_tryon] Loaded fp16 safetensors -> fp32 for {refiner_mode}")
+        else:
+            pipe = pipe.to(dtype=torch.float16)
+            print("[gen_tryon] Loaded fp16 safetensors on CUDA")
     else:
         # CPU: also load fp16 safetensors → cast to fp32 to avoid .bin loading
         # (torch < 2.6 blocks .bin due to CVE-2025-32434)
@@ -108,7 +122,7 @@ def _get_pipeline(refiner_mode: str):
                 **common_kwargs,
             )
             pipe = pipe.to(dtype=torch.float32)
-            print("[gen_tryon] CPU: loaded fp16 safetensors → cast to fp32")
+            print("[gen_tryon] CPU: loaded fp16 safetensors -> cast to fp32")
         except Exception as exc:
             raise RuntimeError(
                 "Khong the load local diffusion. "
@@ -166,8 +180,12 @@ def _get_pipeline(refiner_mode: str):
     if use_cuda:
         # v16.10: cpu_offload is critical for 4GB GPU — moves modules to GPU only when needed
         try:
-            pipe.enable_model_cpu_offload()
-            print("[gen_tryon] model_cpu_offload enabled")
+            if os.getenv("VTON_CPU_OFFLOAD", "1").strip() == "0":
+                pipe = pipe.to("cuda")
+                print("[gen_tryon] full CUDA pipeline enabled")
+            else:
+                pipe.enable_model_cpu_offload()
+                print("[gen_tryon] model_cpu_offload enabled")
         except Exception:
             try:
                 pipe.enable_sequential_cpu_offload()
@@ -260,13 +278,13 @@ def _maybe_apply_cloth_lora(pipe, cloth_type: str, user_prompt: str, enabled: bo
 
 def _build_prompt(user_prompt: str) -> str:
     base = (
-        "high quality photo of person wearing garment, "
-        "subtle natural fabric folds, soft cloth drape on body, "
-        "preserve original sleeve shape and length, "
-        "do not widen sleeves, do not lengthen sleeves, "
-        "photorealistic clothing, natural lighting, sharp details"
+        "photorealistic try-on, single garment layer, natural folds, sharp seams"
     )
     text = (user_prompt or "").strip()
+    if text:
+        words = text.split()
+        if len(words) > 46:
+            text = " ".join(words[:46])
     return f"{base}, {text}" if text else base
 
 
@@ -297,28 +315,13 @@ def generate_tryon_image(
     mask_image = _to_pil_mask(inpaint_mask_gray)
 
     target_h, target_w = init_tryon_rgb.shape[:2]
-    # v16.10: Always resize to 512x512 for diffusion — optimal for SD-inpaint on 4GB GPU.
-    # Larger sizes waste VRAM and can cause OOM; smaller sizes cause numerical instability.
-    # v16.13: Allow caller-specified infer_size (e.g. 640 for dress with complex prints).
-    # On CPU we clamp to 512. On GPU we allow up to 768 (cpu_offload + xformers handle it).
-    try:
-        import torch as _torch
-        _use_cuda = _torch.cuda.is_available()
-    except Exception:
-        _use_cuda = False
-    _requested = int(getattr(config, "infer_size", 0) or 0)
-    if _requested <= 0:
-        INFER_SIZE = 512
-    elif not _use_cuda:
-        INFER_SIZE = 512  # CPU: always 512 for stability
-    else:
-        # Snap to multiple of 64 (SD requirement), clamp to [512, 768]
-        INFER_SIZE = int(np.clip((_requested // 64) * 64, 512, 768))
+    # v16.10: Default 512x512 for SD-inpaint on 4GB GPU.
+    # config.infer_size overrides this (e.g. 640 for dress on higher-VRAM GPUs).
+    INFER_SIZE = int(config.infer_size) if (config.infer_size and config.infer_size >= 512) else 512
     init_image = init_image.resize((INFER_SIZE, INFER_SIZE), Image.LANCZOS)
     mask_image = mask_image.resize((INFER_SIZE, INFER_SIZE), Image.NEAREST)
     infer_w = INFER_SIZE
     infer_h = INFER_SIZE
-    print(f"[gen_tryon] Inference resolution: {INFER_SIZE}x{INFER_SIZE} (requested={_requested}, cuda={_use_cuda})")
 
     # Optional cloth-type LoRA (pretrained external adapters, no retraining).
     _maybe_apply_cloth_lora(
@@ -372,9 +375,10 @@ def generate_tryon_image(
         # Float [0,1] range
         output_np = np.clip(output_np, 0.0, 1.0) * 255.0
     elif _raw_max <= 0.01:
-        # Nearly all zeros — diffusion failed
-        print(f"[gen_tryon] Diffusion produced near-zero output, returning input")
-        return init_tryon_rgb.copy()
+        # Nearly all zeros means diffusion failed. Do not silently return the
+        # init image, because that makes the UI report Local Diffusion while the
+        # visible result is CPU-only.
+        raise RuntimeError("Diffusion produced near-zero output")
 
     output_np = np.clip(output_np, 0, 255).astype(np.uint8)
 
@@ -385,12 +389,7 @@ def generate_tryon_image(
     # Check if output is mostly black (NaN → 0 artifact)
     _mean_brightness = float(output_np.mean())
     if _mean_brightness < 5:
-        print(f"[gen_tryon] WARNING: diffusion output nearly black (mean={_mean_brightness:.1f}), blending with input")
-        output_np = (
-            output_np.astype(np.float32) * 0.5
-            + init_tryon_rgb.astype(np.float32) * 0.5
-        )
-        output_np = np.clip(output_np, 0, 255).astype(np.uint8)
+        raise RuntimeError(f"Diffusion output nearly black (mean={_mean_brightness:.1f})")
 
     # v16.11: Simple mask-based composite — diffusion inside mask, init outside.
     # No sleeve-specific attenuation here; app.py handles sleeve preservation if needed.
@@ -398,16 +397,6 @@ def generate_tryon_image(
         safe_mask = cv2.resize(inpaint_mask_gray, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
     else:
         safe_mask = inpaint_mask_gray.copy()
-
-    # v16.26: For DRESS, use HARD replace (no edge blur) so the diffusion output
-    # fully replaces the init inside the mask. The previous soft alpha (3px
-    # dilate + 5x5 blur) caused a semi-transparent boundary where init pixels
-    # (warped dress + skin fill) bled through, producing the "two-layer" look.
-    # For top, keep the soft edge so sleeves blend naturally into skin.
-    # v16.38: Unified soft alpha for ALL categories (mirrors shirt path).
-    # The previous dress-only hard binary mask produced visible 'stamp'
-    # seams. Soft 5x5 blur blends the diffusion output into surrounding
-    # skin/background naturally.
     safe_mask = cv2.dilate(safe_mask, np.ones((3, 3), np.uint8), iterations=1)
     safe_mask = cv2.GaussianBlur(safe_mask, (5, 5), 0)
     safe_alpha = (safe_mask.astype(np.float32) / 255.0)[..., None]
