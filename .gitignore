@@ -1,9 +1,37 @@
+# Python cache
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-.env
+
+# Virtual environment
 .venv/
+venv/
+env/
 *.egg-info/
+
+# Debug / generated outputs
+debug_out/
+outputs/
+output/
+cache/
+temp/
+tmp/
+
+# AI model weights
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.bin
+
+# Env files
+.env
+*.env
+
+# Frontend / Node
+node_modules/
 dist/
 build/
+*.tsbuildinfo

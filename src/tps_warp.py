@@ -27,13 +27,11 @@ import numpy as np
 def detect_garment_category(cloth_mask: np.ndarray) -> str:
     """Classify garment into category: 'top', 'pants', or 'dress'.
 
-    v16.11d: Improved dress detection.
-
-    Heuristic geometry:
-    - Top:   short (h/w < 1.1), widest at shoulder/sleeve area
-    - Dress: tall (h/w > 1.1), single connected region that extends past torso,
-             bottom hem is wide (skirt flare) OR uniform width throughout
-    - Pants: tall (h/w > 1.3), splits into TWO columns at the lower half (legs)
+    v19.3:
+    - Stronger pants-first routing.
+    - Fix shorts bị nhận thành top.
+    - Fix wide-leg jeans / trousers bị nhận thành dress.
+    - Ưu tiên tín hiệu quần trước khi xét dress.
     """
     ys, xs = np.where(cloth_mask > 0)
     if len(xs) < 100:
@@ -43,50 +41,173 @@ def detect_garment_category(cloth_mask: np.ndarray) -> str:
     x1, x2 = int(xs.min()), int(xs.max())
     h = max(1, y2 - y1)
     w = max(1, x2 - x1)
-    aspect_ratio = h / w
+    aspect_ratio = h / max(1, w)
 
-    # Sample widths at key heights
-    def _w(frac):
-        return _sample_width_at_y(cloth_mask, min(y2 - 1, y1 + int(h * frac)))
+    def _row_pixels(frac: float) -> np.ndarray:
+        y = max(0, min(cloth_mask.shape[0] - 1, y1 + int(h * frac)))
+        return cloth_mask[y, x1:x2 + 1]
 
-    w_shoulder = _w(0.12)   # shoulder area
-    w_waist    = _w(0.45)   # waist / torso middle
-    w_hip      = _w(0.60)   # hip level
-    w_low      = _w(0.75)   # thigh / skirt mid
-    w_hem      = _w(0.90)   # hem / ankle
+    def _row_width(frac: float) -> float:
+        row = _row_pixels(frac)
+        nz = np.where(row > 0)[0]
+        return float(nz.max() - nz.min()) if len(nz) > 4 else 0.0
 
-    # ── Pants detection: two separate leg columns in lower half ──
-    # Count how many disconnected horizontal segments exist at thigh level
-    if aspect_ratio > 1.2:
-        row_thigh = min(y2 - 1, y1 + int(h * 0.70))
-        row_data = cloth_mask[row_thigh, :]
-        # Find connected segments (runs of non-zero pixels)
+    def _count_segments(frac: float) -> tuple[int, list[int]]:
+        row = _row_pixels(frac)
         in_seg = False
-        n_segs = 0
-        for px in row_data:
-            if px > 0 and not in_seg:
-                in_seg = True
-                n_segs += 1
-            elif px == 0:
-                in_seg = False
-        if n_segs >= 2:
+        n_seg = 0
+        gap_widths: list[int] = []
+        cur_gap = 0
+        seen_fg = False
+        for px in row:
+            if px > 0:
+                seen_fg = True
+                if not in_seg:
+                    in_seg = True
+                    n_seg += 1
+                    if cur_gap > 0:
+                        gap_widths.append(cur_gap)
+                        cur_gap = 0
+            else:
+                if in_seg:
+                    in_seg = False
+                if seen_fg:
+                    cur_gap += 1
+        return n_seg, gap_widths
+
+    def _center_gap_ratio(frac_a: float, frac_b: float, band_ratio: float = 0.12) -> float:
+        """Fraction filled inside a vertical band at the center of the mask.
+        Pants have crotch gap → low ratio. Dresses are solid → high ratio."""
+        ya = max(0, min(cloth_mask.shape[0] - 1, y1 + int(h * frac_a)))
+        yb = max(0, min(cloth_mask.shape[0] - 1, y1 + int(h * frac_b)))
+        if yb <= ya:
+            yb = min(cloth_mask.shape[0] - 1, ya + 1)
+        cx = int((x1 + x2) * 0.5)
+        half = max(3, int(w * band_ratio * 0.5))
+        xa = max(0, cx - half)
+        xb = min(cloth_mask.shape[1] - 1, cx + half)
+        band = cloth_mask[ya:yb + 1, xa:xb + 1]
+        if band.size == 0:
+            return 1.0
+        return float((band > 0).mean())
+
+    w_top   = _row_width(0.08)
+    w_waist = _row_width(0.22)
+    w_hip   = _row_width(0.38)
+    w_mid   = _row_width(0.55)
+    w_low   = _row_width(0.72)
+    w_hem   = _row_width(0.90)
+
+    bbox_w = max(1.0, float(w))
+    hem_coverage = w_hem / bbox_w
+    low_coverage = w_low / bbox_w
+    mid_coverage = w_mid / bbox_w
+
+    # 1) Pants-first detection: long pants / wide-leg pants
+    if aspect_ratio > 1.05:
+        two_leg_votes = 0
+        meaningful_gap_votes = 0
+        for frac in (0.52, 0.62, 0.72, 0.82, 0.92):
+            n_seg, gaps = _count_segments(frac)
+            if n_seg >= 2:
+                two_leg_votes += 1
+                # v19.22: lowered gap threshold so a shallow crotch notch on
+                # shorts hanging from a hanger (which inflates aspect_ratio)
+                # still counts as a leg-split signal.
+                if gaps and max(gaps) >= max(3, int(w * 0.022)):
+                    meaningful_gap_votes += 1
+        center_gap_lower = _center_gap_ratio(0.52, 0.92, band_ratio=0.13)
+        if two_leg_votes >= 1 and meaningful_gap_votes >= 1:
+            return "pants"
+        if two_leg_votes >= 2:
+            return "pants"
+        if center_gap_lower < 0.42 and low_coverage >= 0.45:
+            return "pants"
+        if hem_coverage > 0.48 and center_gap_lower < 0.55 and aspect_ratio > 1.20:
             return "pants"
 
-    # ── Dress detection: tall + extends below torso as single region ──
-    # Key signal: bottom half is filled AND not split into two columns
-    if aspect_ratio > 1.0:
-        # Dress typically: shoulder ≤ hip, hip ≥ waist (A-line / flare)
-        # OR shoulder ≈ waist ≈ hip ≈ hem (straight/column dress)
-        hem_coverage = w_hem / max(1, w)  # how much of bbox is filled at hem
-        low_coverage = w_low / max(1, w)
+    # 2) Shorts detection
+    if 0.35 <= aspect_ratio <= 1.35:
+        two_leg_votes = 0
+        meaningful_gap_votes = 0
+        # v19.22: also scan very close to the hem where the V-notch is most
+        # visible on compact boxer-style shorts; lower the min-gap threshold
+        # so a small crotch notch still counts.
+        for frac in (0.55, 0.68, 0.80, 0.88, 0.94, 0.97):
+            n_seg, gaps = _count_segments(frac)
+            if n_seg >= 2:
+                two_leg_votes += 1
+                if gaps and max(gaps) >= max(3, int(w * 0.022)):
+                    meaningful_gap_votes += 1
+        center_gap_short = _center_gap_ratio(0.48, 0.96, band_ratio=0.16)
+        if two_leg_votes >= 1 and meaningful_gap_votes >= 1:
+            return "pants"
+        if center_gap_short < 0.45 and w_hem > max(8.0, w_waist * 0.55):
+            return "pants"
+        if aspect_ratio < 0.85 and center_gap_short < 0.60 and hem_coverage > 0.42:
+            return "pants"
+        # v19.22b: compact-shorts fallback — rectangular cloth in shorts aspect
+        # range with stable mid/low/hem widths is almost always shorts even if
+        # the leg gap is too small for the segment scanner to detect.
+        widths = [w_waist, w_hip, w_mid, w_low, w_hem]
+        widths = [x for x in widths if x > 0]
+        if len(widths) >= 4:
+            wmax = max(widths)
+            wmin = min(widths)
+            if (
+                wmin / wmax >= 0.72
+                and hem_coverage >= 0.50
+                and mid_coverage >= 0.62
+                and aspect_ratio <= 1.30
+            ):
+                return "pants"
 
-        # Dress: lower body still well covered (> 40% of bbox width at hem)
-        if hem_coverage > 0.35 and aspect_ratio > 1.05:
-            # Extra check: it's not a long top (top barely reaches hips)
-            # Dress hem should be well below the torso midpoint
+    # 3) Dress detection: only if no pants signal
+    # v19.41: tightened to stop tees being mis-classified as dresses.
+    # A t-shirt has sleeves at chest level → w_waist (≈22%) ≥ w_hem because
+    # the bbox width is set by the sleeves, not the body. A true dress is
+    # both longer (AR ≥ 1.45) and has a hem at least as wide as the chest
+    # (w_hem / w_waist ≥ 0.92), reflecting a skirt that doesn't narrow.
+    if aspect_ratio > 1.45:
+        center_fill_lower = _center_gap_ratio(0.55, 0.95, band_ratio=0.16)
+        hem_vs_waist = w_hem / max(1.0, w_waist)
+        if (
+            hem_coverage > 0.35
+            and low_coverage > 0.35
+            and center_fill_lower > 0.58
+            and hem_vs_waist >= 0.92
+        ):
             return "dress"
+        nonzero_widths = [x for x in (w_waist, w_hip, w_low, w_hem) if x > 0]
+        if nonzero_widths:
+            width_variation = max(w_waist, w_hip, w_low, w_hem) / max(1.0, min(nonzero_widths))
+            if (
+                aspect_ratio > 1.60
+                and width_variation < 1.45
+                and center_fill_lower > 0.64
+                and hem_coverage > 0.28
+                and hem_vs_waist >= 0.95
+            ):
+                return "dress"
+    # v19.41: mini-dress catch — short AR (1.20–1.45) but the hem flares
+    # clearly past the chest (w_hem ≥ w_waist * 1.15) is a flared dress, not
+    # a top. Tees don't flare; their hem is ≤ chest row width.
+    if 1.20 <= aspect_ratio <= 1.45:
+        if w_waist > 0 and w_hem / w_waist >= 1.15 and hem_coverage >= 0.55:
+            center_fill_lower = _center_gap_ratio(0.55, 0.95, band_ratio=0.16)
+            if center_fill_lower > 0.62:
+                return "dress"
 
-    # ── Top: compact, or very wide sleeve area ──
+    # 4) v19.22: last-chance shorts catch — anything roughly square or wider
+    # than tall with strong hem/mid coverage is almost certainly shorts.
+    # v19.41: skip when the waist row is much wider than the hem — that's a
+    # short-sleeve top whose bbox is set by the sleeves, not a pair of shorts.
+    if 0.55 <= aspect_ratio <= 1.25 and hem_coverage >= 0.45 and mid_coverage >= 0.55:
+        hem_vs_waist = w_hem / max(1.0, w_waist)
+        if hem_vs_waist >= 0.85:
+            return "pants"
+
+    # 5) Default
     return "top"
 
 
@@ -101,32 +222,541 @@ def _sample_width_at_y(cloth_mask: np.ndarray, y: int) -> float:
     return float(xs.max() - xs.min())
 
 
+def _has_pants_crotch_split(cloth_mask: np.ndarray, y1: int, h: int, w: int,
+                            fracs=(0.55, 0.62, 0.70, 0.78, 0.85, 0.92, 0.97)) -> bool:
+    """Scan many rows in the lower half for a clear gap between 2 segments.
+    Wide-leg jeans often have legs touching at the top — but lower rows still split."""
+    min_gap = max(5, int(w * 0.04))
+    H = cloth_mask.shape[0]
+    for frac in fracs:
+        row_y = max(0, min(H - 1, y1 + int(h * frac)))
+        row = cloth_mask[row_y, :]
+        in_seg = False
+        segs: list[tuple[int, int]] = []
+        start = 0
+        for i, px in enumerate(row):
+            if px > 0 and not in_seg:
+                in_seg = True
+                start = i
+            elif px == 0 and in_seg:
+                in_seg = False
+                segs.append((start, i - 1))
+        if in_seg:
+            segs.append((start, len(row) - 1))
+        if len(segs) >= 2:
+            gaps = [segs[i + 1][0] - segs[i][1] for i in range(len(segs) - 1)]
+            if max(gaps) >= min_gap:
+                return True
+    return False
+
+
 def detect_pants_type(cloth_mask: np.ndarray) -> str:
     """Classify pants type: 'shorts', 'cropped', 'regular', 'long'.
 
-    v16.11c: Added  for pants support.
-
-    Based on aspect ratio and length relative to video frame height.
+    v19.3: use garment OWN bbox aspect ratio (h/w) — independent of frame
+    padding. Product photos with lots of whitespace no longer mislead this.
     """
     ys, xs = np.where(cloth_mask > 0)
     if len(xs) < 100:
-        return "regular"  # fallback
+        return "regular"
 
     y1, y2 = int(ys.min()), int(ys.max())
+    x1, x2 = int(xs.min()), int(xs.max())
     h = max(1, y2 - y1)
-    h_frame = cloth_mask.shape[0]
+    w = max(1, x2 - x1)
+    aspect = h / w  # garment-own h/w
 
-    # Fraction of frame height covered by pants
-    pant_ratio = h / h_frame
-
-    if pant_ratio < 0.25:
+    if aspect < 1.15:
         return "shorts"
-    elif pant_ratio < 0.45:
+    elif aspect < 1.75:
         return "cropped"
-    elif pant_ratio < 0.65:
+    elif aspect < 2.40:
         return "regular"
     else:
         return "long"
+
+
+def detect_pants_style(cloth_mask: np.ndarray) -> str:
+    """Classify pants silhouette style.
+
+    v19.3: gate by aspect — for shorts return 'regular' (no wide_leg/skinny).
+    Returns one of: 'skinny', 'wide_leg', 'straight', 'regular'.
+    """
+    ys, xs = np.where(cloth_mask > 0)
+    if len(xs) < 100:
+        return "regular"
+
+    y1, y2 = int(ys.min()), int(ys.max())
+    x1, x2 = int(xs.min()), int(xs.max())
+    h = max(1, y2 - y1)
+    w = max(1, x2 - x1)
+    aspect = h / w
+    # Shorts/cropped: style heuristics on hem vs hip are noisy — default safe.
+    if aspect < 1.40:
+        return "regular"
+
+    def row_width(frac: float) -> float:
+        y = max(0, min(cloth_mask.shape[0] - 1, y1 + int(h * frac)))
+        nz = np.where(cloth_mask[y] > 0)[0]
+        return float(nz.max() - nz.min()) if len(nz) > 4 else 0.0
+
+    hip_w = row_width(0.25)
+    knee_w = row_width(0.65)
+    hem_w = row_width(0.90)
+
+    if hip_w <= 0:
+        return "regular"
+
+    if hem_w < hip_w * 0.45:
+        return "skinny"
+    if hem_w > hip_w * 0.95:
+        return "wide_leg"
+    if abs(hem_w - knee_w) < hip_w * 0.12:
+        return "straight"
+    return "regular"
+
+
+# ── Piecewise pants warp (v19.3) ─────────────────────────────────────────
+
+def _mask_bbox(mask: np.ndarray) -> tuple[int, int, int, int] | None:
+    ys, xs = np.where(mask > 0)
+    if len(xs) < 20:
+        return None
+    return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+
+
+def _split_pants_source_mask(cloth_mask: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Split source pants into hip block, left leg, right leg.
+    Works for shorts, jeans, trousers, wide-leg pants. Bbox-center fallback."""
+    bbox = _mask_bbox(cloth_mask)
+    if bbox is None:
+        z = np.zeros_like(cloth_mask, dtype=np.uint8)
+        return z, z, z
+
+    x1, y1, x2, y2 = bbox
+    h = max(1, y2 - y1)
+    w = max(1, x2 - x1)
+    cx = int((x1 + x2) * 0.5)
+
+    mask_bin = (cloth_mask > 20).astype(np.uint8) * 255
+
+    hip_mask = np.zeros_like(mask_bin)
+    hip_y2 = min(y2, y1 + int(h * 0.42))
+    hip_mask[y1:hip_y2 + 1, x1:x2 + 1] = mask_bin[y1:hip_y2 + 1, x1:x2 + 1]
+
+    lower_y1 = y1 + int(h * 0.42)
+    lower_y2 = y2
+
+    best_score = None
+    best_x = cx
+    search_half = max(4, int(w * 0.18))
+    for xx in range(max(x1, cx - search_half), min(x2, cx + search_half) + 1):
+        col = mask_bin[lower_y1:lower_y2 + 1, xx]
+        score = int((col > 0).sum())
+        score_tuple = (score, abs(xx - cx))
+        if best_score is None or score_tuple < best_score:
+            best_score = score_tuple
+            best_x = xx
+    split_x = int(best_x)
+
+    left_mask = np.zeros_like(mask_bin)
+    right_mask = np.zeros_like(mask_bin)
+    left_mask[lower_y1:y2 + 1, x1:split_x + 1] = mask_bin[lower_y1:y2 + 1, x1:split_x + 1]
+    right_mask[lower_y1:y2 + 1, split_x:x2 + 1] = mask_bin[lower_y1:y2 + 1, split_x:x2 + 1]
+
+    overlap_y1 = y1 + int(h * 0.30)
+    overlap_y2 = y1 + int(h * 0.52)
+    overlap_w = max(3, int(w * 0.05))
+    left_mask[overlap_y1:overlap_y2 + 1, x1:min(x2, split_x + overlap_w) + 1] = \
+        mask_bin[overlap_y1:overlap_y2 + 1, x1:min(x2, split_x + overlap_w) + 1]
+    right_mask[overlap_y1:overlap_y2 + 1, max(x1, split_x - overlap_w):x2 + 1] = \
+        mask_bin[overlap_y1:overlap_y2 + 1, max(x1, split_x - overlap_w):x2 + 1]
+
+    k5 = np.ones((5, 5), np.uint8)
+    hip_mask = cv2.morphologyEx(hip_mask, cv2.MORPH_CLOSE, k5, 1)
+    left_mask = cv2.morphologyEx(left_mask, cv2.MORPH_CLOSE, k5, 1)
+    right_mask = cv2.morphologyEx(right_mask, cv2.MORPH_CLOSE, k5, 1)
+    return hip_mask, left_mask, right_mask
+
+
+def _find_shorts_source_hem_points(
+    mask_bin: np.ndarray,
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    src_cx: float,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Find real left/right leg-opening anchors for shorts."""
+    h = max(1, y2 - y1)
+    w = max(1, x2 - x1)
+    min_seg_w = max(6, int(w * 0.08))
+    best: tuple[float, int, tuple[int, int], tuple[int, int]] | None = None
+
+    for yy in range(y1 + int(h * 0.66), y2 + 1):
+        row = mask_bin[yy] > 20
+        segs: list[tuple[int, int]] = []
+        start = None
+        for xx in range(x1, x2 + 1):
+            if row[xx] and start is None:
+                start = xx
+            elif not row[xx] and start is not None:
+                segs.append((start, xx - 1))
+                start = None
+        if start is not None:
+            segs.append((start, x2))
+
+        left_candidates = [seg for seg in segs if seg[1] < src_cx + w * 0.08]
+        right_candidates = [seg for seg in segs if seg[0] > src_cx - w * 0.08]
+        if not left_candidates or not right_candidates:
+            continue
+
+        left_seg = max(left_candidates, key=lambda seg: seg[1] - seg[0])
+        right_seg = max(right_candidates, key=lambda seg: seg[1] - seg[0])
+        left_w = left_seg[1] - left_seg[0] + 1
+        right_w = right_seg[1] - right_seg[0] + 1
+        if left_w < min_seg_w or right_w < min_seg_w:
+            continue
+
+        # Prefer wide, real leg openings instead of the very bottom crotch sliver.
+        score = float(left_w + right_w) + (yy - y1) * 0.08
+        if best is None or score > best[0]:
+            best = (score, yy, left_seg, right_seg)
+
+    if best is None:
+        return None
+
+    _, yy, left_seg, right_seg = best
+    left = np.array([(left_seg[0] + left_seg[1]) * 0.5, yy], dtype=np.float32)
+    right = np.array([(right_seg[0] + right_seg[1]) * 0.5, yy], dtype=np.float32)
+    return left, right
+
+
+def _affine_piece(
+    cloth_rgb: np.ndarray,
+    cloth_mask: np.ndarray,
+    src_pts: np.ndarray,
+    dst_pts: np.ndarray,
+    out_shape: tuple[int, int],
+) -> tuple[np.ndarray, np.ndarray]:
+    h_out, w_out = out_shape
+    if src_pts.shape[0] < 3 or dst_pts.shape[0] < 3:
+        return (
+            np.zeros((h_out, w_out, 3), dtype=np.uint8),
+            np.zeros((h_out, w_out), dtype=np.uint8),
+        )
+    M = cv2.getAffineTransform(src_pts[:3].astype(np.float32), dst_pts[:3].astype(np.float32))
+    rgb = cv2.warpAffine(
+        cloth_rgb, M, (w_out, h_out),
+        flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0),
+    )
+    m = cv2.warpAffine(
+        cloth_mask, M, (w_out, h_out),
+        flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+    )
+    m = (m > 20).astype(np.uint8) * 255
+    return rgb, m
+
+
+def _composite_piece(
+    base_rgb: np.ndarray,
+    base_mask: np.ndarray,
+    piece_rgb: np.ndarray,
+    piece_mask: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    if cv2.countNonZero(piece_mask) < 20:
+        return base_rgb, base_mask
+    alpha = cv2.GaussianBlur((piece_mask > 20).astype(np.float32), (7, 7), 1.8)
+    alpha = np.clip(alpha, 0.0, 1.0)[..., None]
+    out_rgb = (
+        base_rgb.astype(np.float32) * (1.0 - alpha)
+        + piece_rgb.astype(np.float32) * alpha
+    ).clip(0, 255).astype(np.uint8)
+    out_mask = cv2.bitwise_or(base_mask, piece_mask)
+    return out_rgb, out_mask
+
+
+def _pose_get(pose: dict, key: str, fallback: np.ndarray) -> np.ndarray:
+    val = pose.get(key) if pose else None
+    if val is None:
+        return fallback.astype(np.float32)
+    return np.array(val, dtype=np.float32)
+
+
+def _bbox_warp_pants_cloth(
+    cloth_rgb: np.ndarray,
+    cloth_mask: np.ndarray,
+    pose: dict,
+    output_shape: tuple[int, int],
+    pants_type: str,
+    pants_style: str,
+    fit_scale: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Stable pants warp for cropped people with missing knees/ankles."""
+    h_out, w_out = output_shape
+    canvas = np.zeros((h_out, w_out, 3), dtype=np.uint8)
+    out_mask = np.zeros((h_out, w_out), dtype=np.uint8)
+    bbox = _mask_bbox(cloth_mask)
+    if bbox is None or not pose or "left_hip" not in pose or "right_hip" not in pose:
+        return canvas, out_mask
+
+    x1, y1, x2, y2 = bbox
+    lh = np.array(pose["left_hip"], dtype=np.float32)
+    rh = np.array(pose["right_hip"], dtype=np.float32)
+    hip_c = (lh + rh) * 0.5
+    pose_hip_w = float(np.linalg.norm(lh - rh))
+    ls = pose.get("left_shoulder")
+    rs = pose.get("right_shoulder")
+    if ls is not None and rs is not None:
+        sw_ref = float(np.linalg.norm(np.array(ls, dtype=np.float32) - np.array(rs, dtype=np.float32)))
+    else:
+        sw_ref = pose_hip_w
+    hip_w = max(24.0, pose_hip_w, sw_ref * 0.72)
+
+    top = int(max(0, hip_c[1] - hip_w * 0.44))
+    la = pose.get("left_ankle")
+    ra = pose.get("right_ankle")
+    lk = pose.get("left_knee")
+    rk = pose.get("right_knee")
+    if la is not None and ra is not None:
+        ankle_y = float((la[1] + ra[1]) * 0.5)
+        if pants_type == "cropped":
+            bottom = int(hip_c[1] + (ankle_y - hip_c[1]) * 0.78)
+        elif pants_type == "regular":
+            bottom = int(hip_c[1] + (ankle_y - hip_c[1]) * 0.92)
+        else:
+            bottom = int(ankle_y + hip_w * 0.08)
+    elif lk is not None and rk is not None:
+        knee_y = float((lk[1] + rk[1]) * 0.5)
+        bottom = int(hip_c[1] + (knee_y - hip_c[1]) * (1.75 if pants_type != "cropped" else 1.25))
+    elif pants_type == "cropped":
+        bottom = int(hip_c[1] + hip_w * 1.18)
+    elif pants_type == "regular":
+        bottom = int(hip_c[1] + hip_w * 1.42)
+    else:
+        bottom = int(hip_c[1] + hip_w * 1.62)
+    bottom = min(h_out - 2, max(top + 48, bottom))
+
+    width_mul = 1.52
+    if pants_style == "wide_leg":
+        width_mul = 1.74
+    elif pants_style == "straight":
+        width_mul = 1.60
+    elif pants_style == "skinny":
+        width_mul = 1.34
+    target_w = int(max(42, hip_w * width_mul * fit_scale))
+    target_h = int(max(48, bottom - top))
+    left = int(round(hip_c[0] - target_w * 0.5))
+    right = left + target_w
+    if left < 0:
+        right -= left
+        left = 0
+    if right > w_out:
+        left -= right - w_out
+        right = w_out
+    left = max(0, left)
+    target_w = max(1, right - left)
+
+    prepared = _prepare_cloth_for_warp(cloth_rgb, cloth_mask)
+    crop_rgb = prepared[y1:y2 + 1, x1:x2 + 1]
+    crop_mask = ((cloth_mask[y1:y2 + 1, x1:x2 + 1] > 20).astype(np.uint8)) * 255
+    if crop_rgb.size == 0 or cv2.countNonZero(crop_mask) < 100:
+        return canvas, out_mask
+
+    resized_rgb = cv2.resize(crop_rgb, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+    resized_mask = cv2.resize(crop_mask, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+    resized_mask = (resized_mask > 20).astype(np.uint8) * 255
+
+    y_end = min(h_out, top + target_h)
+    x_end = min(w_out, left + target_w)
+    paste_rgb = resized_rgb[: y_end - top, : x_end - left]
+    paste_mask = resized_mask[: y_end - top, : x_end - left]
+    canvas[top:y_end, left:x_end] = paste_rgb
+    out_mask[top:y_end, left:x_end] = paste_mask
+    out_mask = cv2.morphologyEx(out_mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), 1)
+    return canvas, out_mask
+
+
+def piecewise_warp_pants_cloth(
+    cloth_rgb: np.ndarray,
+    cloth_mask: np.ndarray,
+    pose: dict,
+    output_shape: tuple[int, int],
+    pants_type: str = "long",
+    pants_style: str = "regular",
+    fit_scale: float = 1.05,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Warp pants by hip block + left/right leg pieces (v19.3).
+    Estimates knees/ankles from hips if pose lacks them."""
+    h_out, w_out = output_shape
+    canvas = np.zeros((h_out, w_out, 3), dtype=np.uint8)
+    out_mask = np.zeros((h_out, w_out), dtype=np.uint8)
+
+    bbox = _mask_bbox(cloth_mask)
+    if bbox is None:
+        return canvas, out_mask
+    x1, y1, x2, y2 = bbox
+    src_h = max(1, y2 - y1)
+    src_w = max(1, x2 - x1)
+    src_cx = (x1 + x2) * 0.5
+
+    if not pose or "left_hip" not in pose or "right_hip" not in pose:
+        return canvas, out_mask
+
+    if pants_type != "shorts":
+        bbox_rgb, bbox_mask = _bbox_warp_pants_cloth(
+            cloth_rgb,
+            cloth_mask,
+            pose,
+            output_shape,
+            pants_type,
+            pants_style,
+            fit_scale,
+        )
+        if cv2.countNonZero(bbox_mask) >= 300:
+            return bbox_rgb, bbox_mask
+
+    lh = np.array(pose["left_hip"], dtype=np.float32)
+    rh = np.array(pose["right_hip"], dtype=np.float32)
+    hip_c = (lh + rh) * 0.5
+    # v19.25: MediaPipe hip x-distance is often <50px on frontal poses,
+    # which collapses the whole pants warp into a thin black band. Fall
+    # back to shoulder width * 0.58 when hip width is unrealistically small.
+    pose_hip_w = float(np.linalg.norm(lh - rh))
+    _ls_pt = pose.get("left_shoulder")
+    _rs_pt = pose.get("right_shoulder")
+    if _ls_pt is not None and _rs_pt is not None:
+        _sw_ref = float(np.linalg.norm(np.array(_ls_pt, dtype=np.float32) - np.array(_rs_pt, dtype=np.float32)))
+    else:
+        _sw_ref = pose_hip_w
+    if pants_type == "shorts":
+        hip_w = max(24.0, pose_hip_w, _sw_ref * 0.84)
+    else:
+        hip_w = max(24.0, pose_hip_w, _sw_ref * 0.72)
+
+    body_leg_len = max(80.0, h_out - hip_c[1] - 8.0)
+    lk_fb = lh + np.array([-hip_w * 0.08, body_leg_len * 0.45], dtype=np.float32)
+    rk_fb = rh + np.array([ hip_w * 0.08, body_leg_len * 0.45], dtype=np.float32)
+    la_fb = lh + np.array([-hip_w * 0.10, body_leg_len * 0.92], dtype=np.float32)
+    ra_fb = rh + np.array([ hip_w * 0.10, body_leg_len * 0.92], dtype=np.float32)
+
+    lk = _pose_get(pose, "left_knee", lk_fb)
+    rk = _pose_get(pose, "right_knee", rk_fb)
+    la = _pose_get(pose, "left_ankle", la_fb)
+    ra = _pose_get(pose, "right_ankle", ra_fb)
+
+    if pants_type == "shorts":
+        # v19.4: shorts should reach mid-thigh, not stay near crotch.
+        left_end = lh * 0.38 + lk * 0.62
+        right_end = rh * 0.38 + rk * 0.62
+        # v19.27: on cropped photos, pose knees can collapse to hip level →
+        # shorts shrink to a sliver near the waistband. Enforce a minimum
+        # vertical extent of hip_w · 1.1 below the hip line.
+        _min_drop = hip_w * 0.98
+        if left_end[1] - lh[1] < _min_drop:
+            left_end = np.array([left_end[0], lh[1] + _min_drop], dtype=np.float32)
+        if right_end[1] - rh[1] < _min_drop:
+            right_end = np.array([right_end[0], rh[1] + _min_drop], dtype=np.float32)
+    elif pants_type == "cropped":
+        left_end = lk * 0.30 + la * 0.70
+        right_end = rk * 0.30 + ra * 0.70
+    elif pants_type == "regular":
+        left_end = lk * 0.12 + la * 0.88
+        right_end = rk * 0.12 + ra * 0.88
+    else:
+        left_end = la
+        right_end = ra
+
+    if pants_style == "skinny":
+        thigh_scale, hem_scale = 0.24, 0.13
+    elif pants_style == "wide_leg":
+        thigh_scale, hem_scale = 0.34, 0.30
+    elif pants_style == "straight":
+        thigh_scale, hem_scale = 0.30, 0.23
+    else:
+        thigh_scale, hem_scale = 0.29, 0.20
+    if pants_type == "shorts":
+        # v19.4: sport/casual shorts need wider leg openings.
+        thigh_scale = max(thigh_scale * 1.18, 0.34)
+        hem_scale = max(hem_scale, 0.34)
+
+    thigh_half = hip_w * thigh_scale * fit_scale
+    hem_half = hip_w * hem_scale * fit_scale
+
+    waist_y = hip_c[1] - hip_w * 0.34
+    crotch_y = hip_c[1] + hip_w * 0.38
+    waist_left = np.array([hip_c[0] - hip_w * 0.68 * fit_scale, waist_y], dtype=np.float32)
+    waist_right = np.array([hip_c[0] + hip_w * 0.68 * fit_scale, waist_y], dtype=np.float32)
+    crotch = np.array([hip_c[0], crotch_y], dtype=np.float32)
+
+    hip_mask, left_mask, right_mask = _split_pants_source_mask(cloth_mask)
+    prepared_rgb = _prepare_cloth_for_warp(cloth_rgb, cloth_mask)
+
+    src_waist_l = np.array([x1, y1 + src_h * 0.06], dtype=np.float32)
+    src_waist_r = np.array([x2, y1 + src_h * 0.06], dtype=np.float32)
+    src_crotch  = np.array([src_cx, y1 + src_h * 0.46], dtype=np.float32)
+    src_left_hem  = np.array([x1 + src_w * 0.25, y2], dtype=np.float32)
+    src_right_hem = np.array([x2 - src_w * 0.25, y2], dtype=np.float32)
+    if pants_type in {"shorts", "cropped", "regular", "long"}:
+        hem_points = _find_shorts_source_hem_points(
+            (cloth_mask > 20).astype(np.uint8) * 255,
+            x1,
+            y1,
+            x2,
+            y2,
+            src_cx,
+        )
+        if hem_points is not None:
+            src_left_hem, src_right_hem = hem_points
+
+    # Hip block
+    hip_rgb, hip_warp_mask = _affine_piece(
+        prepared_rgb, hip_mask,
+        np.float32([src_waist_l, src_waist_r, src_crotch]),
+        np.float32([waist_left, waist_right, crotch]),
+        output_shape,
+    )
+    canvas, out_mask = _composite_piece(canvas, out_mask, hip_rgb, hip_warp_mask)
+
+    # Left leg
+    src_left_pts = np.float32([
+        [x1, y1 + src_h * 0.36],
+        [src_cx, y1 + src_h * 0.46],
+        src_left_hem,
+    ])
+    dst_left_outer = lh + np.array([-thigh_half, hip_w * 0.18], dtype=np.float32)
+    dst_left_hem   = np.array([left_end[0] - hem_half, left_end[1]], dtype=np.float32)
+    left_rgb, left_warp_mask = _affine_piece(
+        prepared_rgb, left_mask, src_left_pts,
+        np.float32([dst_left_outer, crotch, dst_left_hem]),
+        output_shape,
+    )
+    canvas, out_mask = _composite_piece(canvas, out_mask, left_rgb, left_warp_mask)
+
+    # Right leg
+    src_right_pts = np.float32([
+        [x2, y1 + src_h * 0.36],
+        [src_cx, y1 + src_h * 0.46],
+        src_right_hem,
+    ])
+    dst_right_outer = rh + np.array([thigh_half, hip_w * 0.18], dtype=np.float32)
+    dst_right_hem   = np.array([right_end[0] + hem_half, right_end[1]], dtype=np.float32)
+    right_rgb, right_warp_mask = _affine_piece(
+        prepared_rgb, right_mask, src_right_pts,
+        np.float32([dst_right_outer, crotch, dst_right_hem]),
+        output_shape,
+    )
+    canvas, out_mask = _composite_piece(canvas, out_mask, right_rgb, right_warp_mask)
+
+    out_mask = cv2.morphologyEx(out_mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8), 1)
+    out_mask = cv2.dilate(out_mask, np.ones((3, 3), np.uint8), 1)
+    if cv2.countNonZero(out_mask) < 80:
+        return canvas, out_mask
+
+    top_guard = max(0, int(waist_y - hip_w * 0.18))
+    out_mask[:top_guard, :] = 0
+    canvas[:top_guard, :] = 0
+    return canvas, out_mask
 
 
 def classify_garment_type(cloth_mask: np.ndarray) -> dict[str, object]:
@@ -1609,6 +2239,13 @@ def simple_affine_warp_cloth(
         # shoulder seam. Scan the top 30% for the widest row → true shoulder width.
         # Also use the overall bbox center_x for x-centering (more stable than a
         # single narrow neckline row, which causes large scale_w errors).
+        # v18.9: For LONG-SLEEVE dresses, the top-30% widest row catches the
+        # sleeve span (arms extended sideways) instead of body shoulder, which
+        # inflates cloth_shoulder_w → underestimates scale_w → garment renders
+        # too short on body. Cross-check against body width at hip level
+        # (60-75%) — that band is sleeve-free. If the top-30% width is much
+        # wider than hip-band body width, treat that as a sleeve artefact and
+        # fall back to the hip-band width as the body reference.
         _top30_end = min(h_mask, y1 + int(cloth_h * 0.30))
         _best_w, _best_sx, _best_ex = 0, None, None
         for _row in range(max(0, y1 + int(cloth_h * 0.05)), _top30_end):
@@ -1619,9 +2256,25 @@ def simple_affine_warp_cloth(
                     _best_w = _rw
                     _best_sx = float(_nz[0])
                     _best_ex = float(_nz[-1])
+        _hip_band_widths: list[int] = []
+        _hip_band_start = y1 + int(cloth_h * 0.60)
+        _hip_band_end = min(h_mask, y1 + int(cloth_h * 0.78))
+        for _row in range(max(0, _hip_band_start), _hip_band_end):
+            _nz = np.where(cloth_mask[_row] > 0)[0]
+            if len(_nz) > 4:
+                _hip_band_widths.append(int(_nz[-1]) - int(_nz[0]))
+        _hip_band_w = float(np.median(_hip_band_widths)) if _hip_band_widths else 0.0
         if _best_sx is not None and _best_w > 10:
-            cloth_shoulder_w = float(_best_w)
+            # If the top-30% peak is >35% wider than the hip body band, it is
+            # almost certainly a sleeve. Use the hip band as body width.
+            if _hip_band_w > 10 and _best_w > _hip_band_w * 1.35:
+                cloth_shoulder_w = _hip_band_w
+            else:
+                cloth_shoulder_w = float(_best_w)
             cloth_center_x = float(x1 + x2) / 2.0  # bbox center for stability
+        elif _hip_band_w > 10:
+            cloth_shoulder_w = _hip_band_w
+            cloth_center_x = float(x1 + x2) / 2.0
         else:
             cloth_shoulder_w = float(cloth_w)
             cloth_center_x = float(x1 + x2) / 2.0
@@ -1649,20 +2302,19 @@ def simple_affine_warp_cloth(
     person_shoulder_y = float(min(ls[1], rs[1]))
     person_torso_h = float(max(lh[1], rh[1]) - min(ls[1], rs[1]))
 
-    # v16.12: Dress target height = shoulders → ankle (or canvas bottom).
+    # v18.8: Source aspect ratio dictates dress length. The old branch set
+    # target_height = ankle_y - shoulder_y, forcing mid-thigh sources to
+    # vertically stretch ~2x → ikat/print patterns rendered as vertical
+    # streaks, and hems landed near ankles regardless of source. The new
+    # behaviour scales height from the width-scale (uniform), so mid-thigh
+    # stays mid-thigh and maxi stays maxi. The downstream scale_ratio_limit
+    # still allows a small ±15% non-uniform nudge for fit.
     if garment_category == "dress":
-        _la = pose.get("left_ankle") or pose.get("left_knee")
-        _ra = pose.get("right_ankle") or pose.get("right_knee")
-        if _la and _ra:
-            _ankle_y = float((_la[1] + _ra[1]) / 2.0)
-        else:
-            _ankle_y = person_shoulder_y + person_torso_h * 2.8  # fallback estimate
-        # Clip to canvas bottom — never render past frame.
-        _target_bottom = float(min(h_out - 2, _ankle_y))
-        # Ensure hem below hips at minimum.
-        _target_bottom = float(max(_target_bottom,
-                                   person_shoulder_y + person_torso_h * 1.6))
-        target_height = max(person_torso_h * 1.05, _target_bottom - person_shoulder_y)
+        _person_hip_w_est = float(abs(rh[0] - lh[0]))
+        _person_ref_w = max(person_sw, _person_hip_w_est)
+        _w_scale_est = (_person_ref_w * 1.10) / max(cloth_shoulder_w, 10.0)
+        _w_scale_est = float(np.clip(_w_scale_est, 0.5, 3.0))
+        target_height = cloth_h * _w_scale_est
     else:
         target_height = person_torso_h * 1.05
 
@@ -1687,8 +2339,10 @@ def simple_affine_warp_cloth(
 
     # When scales differ wildly, use the smaller one to avoid distortion
     # but allow moderate non-uniform scaling for better fit
-    # v16.12: Dresses legitimately need taller-than-wider scaling.
-    scale_ratio_limit = 2.4 if garment_category == "dress" else 1.5
+    # v18.8: Tightened from 2.4 → 1.18 for dress. Source aspect now drives
+    # height (uniform with width). The 18% slack absorbs minor body-shape
+    # mismatch without re-introducing vertical pattern streaks.
+    scale_ratio_limit = 1.18 if garment_category == "dress" else 1.5
     scale_ratio = max(scale_w, scale_h) / max(min(scale_w, scale_h), 0.01)
     if scale_ratio > scale_ratio_limit:
         s_min = min(scale_w, scale_h)
@@ -1696,7 +2350,7 @@ def simple_affine_warp_cloth(
         scale_h = min(scale_h, s_min * scale_ratio_limit)
 
     scale_w = float(np.clip(scale_w, 0.5, 3.0))
-    scale_h = float(np.clip(scale_h, 0.5, 3.5 if garment_category == "dress" else 3.0))
+    scale_h = float(np.clip(scale_h, 0.5, 3.0 if garment_category == "dress" else 3.0))
 
     # Target: collar at shoulder midpoint, slightly above
     # v16.19: Dress neckline sits at neck level (~12% torso_h above shoulder_y).
@@ -1730,7 +2384,247 @@ def simple_affine_warp_cloth(
     return warped_cloth, warped_mask
 
 
-# ── Long-sleeve TPS helper ──────────────────────────────────────────
+# ── Piecewise dress warp (v18.24) ───────────────────────────────────
+
+def piecewise_warp_dress_cloth(
+    cloth_rgb: np.ndarray,
+    cloth_mask: np.ndarray,
+    pose: dict[str, tuple[int, int]],
+    output_shape: tuple[int, int],
+    silhouette: str = "a_line",
+    length: str = "midi",
+) -> tuple[np.ndarray, np.ndarray]:
+    """Piecewise (per-row) dress warp — replacement for pure affine.
+
+    Same vertical placement / overall scale as `simple_affine_warp_cloth`'s
+    dress branch, but each output row is independently horizontally
+    stretched so the garment silhouette follows shoulder → waist → hip →
+    hem widths derived from body anthropometry + the named silhouette
+    template (from ``src.garment_silhouettes``).
+
+    The result is a body-following silhouette: bodycon/sheath stays ~shoulder
+    width through the hip, a-line flares from waist down, mermaid keeps a
+    narrow knee with a flared hem.  Diffusion then only has to do
+    fold/shading work — the form is already correct.
+
+    Falls back to ``simple_affine_warp_cloth`` on any failure (small mask,
+    missing landmarks, numeric issues).
+    """
+    try:
+        from src.garment_silhouettes import (
+            DRESS_TEMPLATES,
+            SAMPLE_FRACS_DRESS,
+        )
+    except Exception:
+        return simple_affine_warp_cloth(
+            cloth_rgb, cloth_mask, pose, output_shape, garment_category="dress"
+        )
+
+    cloth_rgb = _prepare_cloth_for_warp(cloth_rgb, cloth_mask)
+
+    h_out, w_out = output_shape
+    ys, xs = np.where(cloth_mask > 0)
+    if len(xs) < 200:
+        return simple_affine_warp_cloth(
+            cloth_rgb, cloth_mask, pose, output_shape, garment_category="dress"
+        )
+
+    y1, y2 = int(ys.min()), int(ys.max())
+    x1, x2 = int(xs.min()), int(xs.max())
+    cloth_h = max(1, y2 - y1)
+    cloth_cx_src = float(x1 + x2) / 2.0
+
+    # ── Sample source half-widths at standard fractions ────────────
+    h_mask = cloth_mask.shape[0]
+    src_halves: list[float] = []
+    for f in SAMPLE_FRACS_DRESS:
+        row = max(0, min(h_mask - 1, y1 + int(cloth_h * f)))
+        nz = np.where(cloth_mask[row] > 0)[0]
+        if len(nz) >= 4:
+            src_halves.append(float(nz[-1] - nz[0]) * 0.5)
+        else:
+            src_halves.append(0.0)
+
+    # Anti-sleeve guard: for long-sleeve dresses with arms extended sideways,
+    # the upper rows catch the SLEEVE span, not the body bust.  Cross-check
+    # against a hip-band median (60-78% of garment height — always sleeve-free)
+    # and treat oversized top widths as sleeve artefacts.
+    _top30_end = min(h_mask, y1 + int(cloth_h * 0.30))
+    _best_top_full = 0
+    for _row in range(max(0, y1 + int(cloth_h * 0.05)), _top30_end):
+        _nz = np.where(cloth_mask[_row] > 0)[0]
+        if len(_nz) > 4:
+            _rw = int(_nz[-1]) - int(_nz[0])
+            if _rw > _best_top_full:
+                _best_top_full = _rw
+    _hip_widths: list[int] = []
+    for _row in range(max(0, y1 + int(cloth_h * 0.60)),
+                      min(h_mask, y1 + int(cloth_h * 0.78))):
+        _nz = np.where(cloth_mask[_row] > 0)[0]
+        if len(_nz) > 4:
+            _hip_widths.append(int(_nz[-1]) - int(_nz[0]))
+    _hip_full = float(np.median(_hip_widths)) if _hip_widths else 0.0
+    # Bust half = max of upper rows (handles missing 0.12 row).  If top span
+    # is >35% wider than hip span, treat as long-sleeve artefact and fall
+    # back to hip half-width as the body reference.
+    bust_half_src = max(src_halves[0], src_halves[1])
+    if _hip_full > 10 and _best_top_full > _hip_full * 1.35:
+        bust_half_src = _hip_full * 0.5
+        # Override top-row half-widths so per-row scale doesn't over-shrink the
+        # shoulder region using the (artefactual) sleeve span.
+        src_halves[0] = bust_half_src * 0.92
+        src_halves[1] = bust_half_src
+    if bust_half_src < 6.0:
+        return simple_affine_warp_cloth(
+            cloth_rgb, cloth_mask, pose, output_shape, garment_category="dress"
+        )
+
+    # ── Body landmarks ─────────────────────────────────────────────
+    try:
+        ls = np.array(pose["left_shoulder"], dtype=np.float64)
+        rs = np.array(pose["right_shoulder"], dtype=np.float64)
+        lh = np.array(pose["left_hip"], dtype=np.float64)
+        rh = np.array(pose["right_hip"], dtype=np.float64)
+    except Exception:
+        return simple_affine_warp_cloth(
+            cloth_rgb, cloth_mask, pose, output_shape, garment_category="dress"
+        )
+
+    person_sw = float(np.linalg.norm(ls - rs))
+    person_hip_w = float(abs(rh[0] - lh[0]))
+    person_cx = float((ls[0] + rs[0]) / 2.0)
+    person_shoulder_y = float(min(ls[1], rs[1]))
+    person_torso_h = float(max(lh[1], rh[1]) - min(ls[1], rs[1]))
+    if person_sw < 30 or person_torso_h < 40:
+        return simple_affine_warp_cloth(
+            cloth_rgb, cloth_mask, pose, output_shape, garment_category="dress"
+        )
+
+    # ── Vertical placement (mirror simple_affine_warp_cloth dress) ─
+    person_ref_w = max(person_sw, person_hip_w)
+    # Width-scale anchor: bust half-width should land near person_ref_w/2 * 1.10
+    target_bust_half = person_ref_w * 0.55
+    w_scale = float(np.clip(target_bust_half / bust_half_src, 0.5, 3.0))
+    target_top_y = person_shoulder_y - person_torso_h * 0.12
+
+    # v18.26: length-aware target_bot_y.  The aspect-uniform target
+    # (cloth_h * w_scale) leaves long-sleeve sources too short on tall
+    # models because their cloth_h is compressed by the arms-down pose.
+    # Pin the hem to a body-anchored Y for the detected length:
+    #   mini  → ~mid-thigh
+    #   midi  → ~mid-calf
+    #   maxi  → ~ankle
+    # then take the larger of (aspect-uniform, body-anchored).
+    hip_y = float((lh[1] + rh[1]) * 0.5)
+    length_norm = (length or "midi").strip().lower()
+    if length_norm == "mini":
+        body_target_bot_y = hip_y + person_torso_h * 0.55
+    elif length_norm == "maxi":
+        body_target_bot_y = hip_y + person_torso_h * 2.05
+    else:
+        body_target_bot_y = hip_y + person_torso_h * 1.35
+    # Clamp body-anchored hem to canvas to avoid drawing off-frame.
+    body_target_bot_y = float(min(body_target_bot_y, h_out - 4))
+    aspect_height = cloth_h * w_scale
+    body_height = max(20.0, body_target_bot_y - target_top_y)
+    # v18.27: tightened stretch cap from 1.35 → 1.20.  Beyond 20% vertical
+    # stretch the dress texture starts producing vertical streak/scratch
+    # artefacts (each source row gets smeared across multiple output rows
+    # of the same pattern).  Within 20% the streaks are hidden by diffusion's
+    # fold shading.  Midi/maxi dresses that need more length will simply use
+    # the aspect_height anchor — better short-but-clean than long-but-streaky.
+    target_height = float(min(body_height, aspect_height * 1.20))
+    target_height = max(target_height, aspect_height)
+    target_bot_y = target_top_y + target_height
+
+    # ── Target half-width curve from silhouette template ───────────
+    # v18.26: sheath/shift are straight tubes — disable per-row variation so the
+    # 4% waist multiplier doesn't create a visible pinch after diffusion.
+    uniform_scale = silhouette in {"sheath", "shift"}
+    tmpl = DRESS_TEMPLATES.get(silhouette, DRESS_TEMPLATES["a_line"])
+    target_halves: list[float] = []
+    for f in SAMPLE_FRACS_DRESS:
+        if uniform_scale:
+            mult = 1.0
+        else:
+            mult = tmpl[f]
+        half_px = target_bust_half * mult
+        # Clamp per band to body anthropometry so we never paint past arms.
+        if f <= 0.30:
+            ceil_px = person_sw * 0.74
+        elif f <= 0.50:
+            ceil_px = max(person_sw * 0.74, person_hip_w * 0.85)
+        elif f <= 0.75:
+            ceil_px = max(person_sw * 0.92, person_hip_w * 1.10)
+        else:
+            ceil_px = max(person_sw * 1.05, person_hip_w * 1.45)
+        floor_px = person_sw * 0.40
+        target_halves.append(float(np.clip(half_px, floor_px, ceil_px)))
+
+    # v18.26: also flatten source half-widths for sheath/shift so per-row
+    # scale stays constant — otherwise a slightly tapered source waist
+    # would still show up as a thinning ring in the output.
+    if uniform_scale:
+        src_halves = [bust_half_src] * len(SAMPLE_FRACS_DRESS)
+
+    fracs_arr = np.array(SAMPLE_FRACS_DRESS, dtype=np.float32)
+    src_halves_arr = np.array(src_halves, dtype=np.float32)
+    tgt_halves_arr = np.array(target_halves, dtype=np.float32)
+
+    # ── Build dense per-row scale + source-y maps ──────────────────
+    y_out_idx = np.arange(h_out, dtype=np.float32)
+    # frac within target garment span (clipped 0..1)
+    frac = np.clip((y_out_idx - target_top_y) / max(target_height, 1.0), 0.0, 1.0)
+    # source y for each output row
+    src_y_per_row = y1 + frac * cloth_h
+    # per-row half widths via interp
+    src_half_per_row = np.interp(frac, fracs_arr, src_halves_arr)
+    tgt_half_per_row = np.interp(frac, fracs_arr, tgt_halves_arr)
+    # avoid zero-source half (fall back to neighbouring sample)
+    src_half_per_row = np.where(src_half_per_row < 2.0,
+                                np.maximum(bust_half_src, 2.0),
+                                src_half_per_row)
+    scale_per_row = src_half_per_row / np.maximum(tgt_half_per_row, 2.0)
+    # v18.28: smooth scale curve so abrupt waist scale changes don't create
+    # vertical streak artefacts ("xước") where adjacent rows pull from very
+    # different x-ranges. Kernel ~3% of height keeps silhouette intact.
+    _smooth_k = max(3, int(h_out * 0.03) | 1)
+    scale_per_row = cv2.GaussianBlur(
+        scale_per_row.reshape(-1, 1), (1, _smooth_k), 0
+    ).reshape(-1)
+
+    # ── Build remap fields ─────────────────────────────────────────
+    x_out_idx = np.arange(w_out, dtype=np.float32)
+    map_x = (x_out_idx[None, :] - person_cx) * scale_per_row[:, None] + cloth_cx_src
+    map_y = np.broadcast_to(src_y_per_row[:, None], (h_out, w_out)).astype(np.float32)
+    # Pixels outside the dress vertical span: send to -1 so cv2.remap leaves them
+    # at borderValue 0.
+    outside = (y_out_idx < target_top_y - 1) | (y_out_idx > target_bot_y + 1)
+    map_x = np.ascontiguousarray(map_x, dtype=np.float32)
+    map_y = np.ascontiguousarray(map_y, dtype=np.float32)
+    if outside.any():
+        map_x[outside, :] = -1.0
+        map_y[outside, :] = -1.0
+
+    # v18.28: INTER_CUBIC for cloth (sharper texture preservation) — mask stays
+    # linear since binary upscaling doesn't benefit from cubic.
+    warped_cloth = cv2.remap(
+        cloth_rgb, map_x, map_y,
+        interpolation=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0),
+    )
+    warped_mask = cv2.remap(
+        cloth_mask, map_x, map_y,
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    warped_mask = refine_warped_mask(warped_mask)
+    return warped_cloth, warped_mask
+
+
+
 
 def _warp_long_sleeve_tps(
     cloth_prepared: np.ndarray,

@@ -39,9 +39,14 @@ def _export_cache_vars(base_dir: Path) -> None:
     # Force model/cache downloads to the configured storage root (default on drive E).
     hf_home = base_dir / "huggingface"
     huggingface_hub_cache = hf_home / "hub"
+    hf_assets_cache = hf_home / "assets"
     torch_home = base_dir / "torch"
+    xdg_cache_home = base_dir / "cache"
+    u2net_home = base_dir / "u2net"
+    rembg_home = base_dir / "rembg"
+    mediapipe_home = base_dir / "cache" / "mediapipe"
 
-    for directory in (hf_home, huggingface_hub_cache, torch_home):
+    for directory in (hf_home, huggingface_hub_cache, hf_assets_cache, torch_home, xdg_cache_home, u2net_home, rembg_home, mediapipe_home):
         directory.mkdir(parents=True, exist_ok=True)
 
     os.environ["HF_HOME"] = str(hf_home)
@@ -49,4 +54,10 @@ def _export_cache_vars(base_dir: Path) -> None:
     os.environ.pop("TRANSFORMERS_CACHE", None)
     os.environ["HUGGINGFACE_HUB_CACHE"] = str(huggingface_hub_cache)
     os.environ["HF_HUB_CACHE"] = str(huggingface_hub_cache)
+    os.environ["HF_ASSETS_CACHE"] = str(hf_assets_cache)
+    os.environ["DIFFUSERS_CACHE"] = str(huggingface_hub_cache)
     os.environ["TORCH_HOME"] = str(torch_home)
+    os.environ["XDG_CACHE_HOME"] = str(xdg_cache_home)
+    os.environ["U2NET_HOME"] = str(u2net_home)
+    os.environ["REMBG_HOME"] = str(rembg_home)
+    os.environ["MEDIAPIPE_HOME"] = str(mediapipe_home)

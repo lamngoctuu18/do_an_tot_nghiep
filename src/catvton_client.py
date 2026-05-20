@@ -9,7 +9,15 @@ from gradio_client.exceptions import AppError
 
 DEFAULT_SPACES = os.getenv(
     "CATVTON_SPACES",
-    "FIT-Check/CatVTON,Nymbo/CatVTON,Shad0ws/CatVTON,hungdang1610/CatVTON",
+    # v18.23: expanded space list. Many older spaces have been paused; we
+    # try a wider net of public CatVTON forks so at least one is alive.
+    "zhengchong/CatVTON,"
+    "FIT-Check/CatVTON,"
+    "Nymbo/CatVTON,"
+    "Shad0ws/CatVTON,"
+    "hungdang1610/CatVTON,"
+    "PrasannaKumar1812/CatVTON,"
+    "vilarin/CatVTON",
 )
 
 
