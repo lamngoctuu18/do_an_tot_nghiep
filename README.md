@@ -1,435 +1,399 @@
-# VTON Shop - Hệ thống Virtual Try-On
+<div align="center">
 
-Project này là đồ án thử đồ ảo cho thời trang, gồm một web shop React và một backend AI xử lý ảnh người mẫu + ảnh trang phục để tạo ảnh try-on. Trọng tâm hiện tại là kiến trúc cloud-primary: ưu tiên dùng các backend VTON trên cloud để có chất lượng tốt hơn, sau đó tự động fallback về pipeline local khi cloud không khả dụng.
+# Xây dựng hệ thống thử đồ ảo dựa trên mô hình thị giác máy tính
 
-## Những gì đã đạt được
+### *Virtual Try-On System Powered by Computer Vision Models*
 
-### 1. Web shop hoàn chỉnh ở mức prototype
+**Hệ thống thử đồ ảo thương mại điện tử end-to-end** — kết hợp diffusion pipeline AI với web shop React và NestJS API.
 
-- Đã xây dựng frontend bằng React, TypeScript, Vite và Tailwind CSS.
-- Có trang danh sách sản phẩm với tìm kiếm, lọc theo danh mục và sắp xếp theo giá hoặc đánh giá.
-- Có trang chi tiết sản phẩm với ảnh, giá, mô tả, size, màu sắc, rating và nút thử đồ AI.
-- Có giỏ hàng bằng React Context: thêm sản phẩm, tăng/giảm số lượng, xóa từng dòng, xóa toàn bộ và tính tổng tiền.
-- Có routing đầy đủ:
-  - `/` - danh sách sản phẩm
-  - `/product/:id` - chi tiết sản phẩm
-  - `/try-on` - thử đồ bằng ảnh tự upload
-  - `/try-on/:id` - thử đồ từ sản phẩm đã chọn
-  - `/cart` - giỏ hàng
-- Có giao diện responsive cho desktop và mobile.
+<p>
+  <img alt="Python" src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white">
+  <img alt="PyTorch" src="https://img.shields.io/badge/PyTorch-2.4-EE4C2C?logo=pytorch&logoColor=white">
+  <img alt="FastAPI" src="https://img.shields.io/badge/FastAPI-0.115-009688?logo=fastapi&logoColor=white">
+  <img alt="React" src="https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=white">
+  <img alt="NestJS" src="https://img.shields.io/badge/NestJS-10-E0234E?logo=nestjs&logoColor=white">
+  <img alt="Tailwind" src="https://img.shields.io/badge/Tailwind-4-38BDF8?logo=tailwindcss&logoColor=white">
+  <img alt="Diffusers" src="https://img.shields.io/badge/Diffusers-0.34-FFD21E">
+  <img alt="Gemini" src="https://img.shields.io/badge/Gemini-2.5%20Flash-4285F4?logo=google&logoColor=white">
+</p>
 
-### 2. Trang thử đồ AI trên frontend
+</div>
 
-- Người dùng có thể upload ảnh người mẫu và ảnh trang phục.
-- Nếu đi từ trang sản phẩm, ảnh trang phục được tự động lấy từ sản phẩm đó.
-- Có hai chế độ xử lý:
-  - `Cloud AI`: ưu tiên CatVTON / IDM-VTON / Fal.ai.
-  - `Local SD`: dùng pipeline local với Stable Diffusion Inpainting.
-- Có nhóm tùy chỉnh pipeline:
-  - độ rộng trang phục
-  - độ hòa trộn
-  - dịch dọc
-  - prompt mô tả trang phục
-  - số bước refine
-  - guidance
-  - mức giữ texture gốc
-  - preset chất lượng
-  - refiner mode
-  - loại trang phục
-- Frontend gọi API `/api/tryon`, nhận kết quả PNG, hiển thị trạng thái xử lý, backend đã dùng, warning và pipeline info.
-- Có thao tác reset và tải ảnh kết quả.
+---
 
-### 3. Backend FastAPI thống nhất
+## Tổng quan
 
-- Đã có `server.py` để chạy một process duy nhất cho cả frontend và API.
-- Backend cung cấp:
-  - `POST /api/tryon`: nhận multipart upload `person` và `cloth`, chạy pipeline, trả ảnh PNG.
-  - `GET /api/health`: health check.
-- Khi có build frontend ở `web-shop/dist`, server tự serve SPA React.
-- Nếu chưa có `dist`, `server.py` có logic build frontend bằng `npm run build` trước khi khởi động.
-- API trả metadata qua header:
-  - `X-Info`
-  - `X-Pipeline-Info`
-  - `X-Backend`
-  - `X-Warning`
-- Có timeout xử lý qua `VTON_CLOUD_TIMEOUT`, mặc định 600 giây.
-- Có CORS để frontend dev server có thể gọi API.
+Đề tài tốt nghiệp xây dựng một hệ thống Virtual Try-On (VTON) hoàn chỉnh, ứng dụng các mô hình thị giác máy tính (human parsing, pose estimation, garment segmentation, diffusion inpainting) để cho phép người dùng "mặc thử" trang phục trực tuyến trên ảnh của chính mình. Hệ thống được tổ chức thành **ba lớp độc lập** đóng gói trong cùng repository:
 
-### 4. Gradio UI vẫn được giữ lại
+| Lớp | Stack | Vai trò |
+|---|---|---|
+| **AI Pipeline** | Python · PyTorch · Diffusers · OpenCV · MediaPipe | Cloud-primary VTON với fallback local SD-Inpaint |
+| **Shop API** | NestJS · TypeORM · MySQL · JWT | E-commerce backend (auth, sản phẩm, giỏ, đơn) |
+| **Storefront** | React 19 · Vite · Tailwind 4 · React Router | UI khách hàng + trang thử đồ AI |
 
-- `app.py` vẫn có giao diện Gradio standalone để test pipeline trực tiếp.
-- Chạy bằng `python app.py`, mặc định mở ở `http://127.0.0.1:7860`.
-- Gradio dùng cùng hàm `try_on()` với FastAPI, nên thuận tiện để debug pipeline mà không cần frontend React.
+Triết lý thiết kế: **TPS warp là output chính, diffusion là refiner** — giữ form và chi tiết áo gốc, chỉ dùng SD để vẽ lại các vùng mép và đổ bóng tự nhiên.
 
-### 5. Pipeline AI cloud-primary
+---
 
-Pipeline chính trong `try_on()` hiện đi theo hướng:
+## Điểm nổi bật
 
-```text
-Input person + cloth
--> lưu ảnh tạm
--> phân loại trang phục
--> Cloud VTON nếu bật
--> hậu xử lý giữ identity
--> nếu cloud lỗi: fallback local CPU geometric pipeline
--> nếu bật AI refine: local Stable Diffusion Inpainting
--> overlay lại tóc / foreground khi có parsing
--> lưu output
+- **Cloud-primary, local-fallback** — tự động xoay vòng giữa CatVTON · IDM-VTON · Fal.ai FLUX Klein · Replicate, có cooldown và multi-space failover.
+- **Pipeline category-aware** — mỗi loại trang phục (`top`/`hoodie`/`jacket`/`pants`/`jeans`/`dress`/`skirt`/`accessory`) có mask, preset và negative-prompt riêng.
+- **Dress Pipeline v2** — luồng riêng cho váy với pose-driven silhouette, hair-underlap-aware mask và Telea-inpainted seed (gated bằng `VTON_DRESS_PIPELINE_V2`).
+- **Gemini Vision auto-prompt** — phân tích người + áo, sinh positive/negative prompt JSON; có retry + exponential backoff + fallback model + image-hash cache.
+- **3 chế độ prompt trên UI**: `Auto Gemini` / `Theo loại` / `Thủ công`.
+- **Hoodie subtype** đặc thù — mask siết theo TPS warp, cap `dilate-7px`, prompt chống kink/extra-arm/missing-pocket.
+- **Stylist AI — gợi ý phối đồ** — sau khi thử đồ, người dùng chọn dịp/phong cách và gọi Gemini Vision để nhận JSON: màu chính, palette nên phối, màu cần tránh, danh sách item gợi ý (giày · túi · phụ kiện…), style summary và short tip. Endpoint riêng (`POST /api/tryon/recommend`) để không block luồng generate; có cache SHA256 + retry + fallback theo category khi Gemini không khả dụng.
+- **Storage tách bạch** — toàn bộ model cache + output đẩy về `VTO_BASE_DIR`, không đụng ổ hệ thống.
+
+---
+
+## Kiến trúc
+
+```
+        ┌────────────────────┐         ┌─────────────────────┐
+        │  React Storefront  │◄────────│   NestJS Shop API   │
+        │  (Vite · TS · TW)  │  REST   │   (TypeORM · MySQL) │
+        └─────────┬──────────┘         └─────────────────────┘
+                  │ multipart /api/tryon
+                  ▼
+        ┌────────────────────┐
+        │  FastAPI server.py │◄── serves React build + JSON
+        └─────────┬──────────┘
+                  │ try_on(person, cloth, prompt_mode, …)
+                  ▼
+        ┌────────────────────────────────────────────────────┐
+        │            app.py · pipeline orchestrator           │
+        ├────────────────────────────────────────────────────┤
+        │  ① Gemini prompt          (auto / fallback / off)  │
+        │  ② Garment routing        (category lock + parse)   │
+        │  ③ Cloud VTON router      (CatVTON → IDM → FAL)     │
+        │         │ on failure                                │
+        │         ▼                                           │
+        │  ④ Local CPU geometric    (parse · pose · warp)     │
+        │  ⑤ Local SD-Inpaint       (dpm++/lcm/hyper-sd)      │
+        │  ⑥ Occlusion restore      (hair · hand · shoes)     │
+        │  ⑦ Postprocess            (color anchor · ghost rm) │
+        └────────────────────────────────────────────────────┘
 ```
 
-Cloud router đã đạt được:
+---
 
-- Tự động thử nhiều backend theo thứ tự:
-  1. CatVTON Cloud
-  2. IDM-VTON Cloud
-  3. Fal.ai FLUX Klein Try-On LoRA
-  4. Replicate, nếu cấu hình token
-- Có cooldown cho backend cloud bị lỗi GPU, paused hoặc runtime error.
-- Có CatVTON multi-space failover qua `CATVTON_SPACES`.
-- Có hỗ trợ `HF_TOKEN` cho Hugging Face Space private hoặc cần token.
-- Có fallback local nếu toàn bộ cloud route không khả dụng.
+## Cấu trúc thư mục
 
-### 6. Pipeline local CPU geometric fallback
-
-Pipeline local đã được nâng cấp nhiều phần để tránh phụ thuộc hoàn toàn vào cloud:
-
-- Human parsing bằng SegFormer `mattmdjaga/segformer_b2_clothes`.
-- Pose detection bằng MediaPipe.
-- Làm mượt landmark pose để giảm méo khi warp.
-- Cloth segmentation bằng U2Net qua `rembg` nếu có, fallback về threshold + GrabCut nếu thiếu thư viện.
-- Merge thêm mask từ SegFormer khi parse được ảnh trang phục.
-- Body measurement để đo vai, hông, torso và chân.
-- Pre-fit scale trang phục trước khi warp để giữ form.
-- Phân loại trang phục theo silhouette:
-  - top
-  - pants
-  - dress
-- Phân loại sleeve:
-  - sleeveless
-  - short sleeve
-  - long sleeve
-- Có xử lý riêng cho pants bằng hip alignment và landmark phần chân.
-- Có xử lý riêng cho dress bằng full-body coverage, dress mask và các bước phục hồi texture.
-- Warp bằng affine + TPS, có thêm sleeve warp theo pose tay.
-- Erase áo cũ bằng skeleton mask thay vì chỉ dựa vào parsing cũ.
-- Blend bằng soft mask và bảo vệ foreground như tay, mặt, tóc.
-- Overlay lại tóc gốc sau khi tạo ảnh để giữ identity tốt hơn.
-
-### 7. Local diffusion refinement
-
-Khi bật AI refinement mà cloud không dùng được hoặc người dùng chọn Local SD, project dùng Stable Diffusion Inpainting:
-
-- Model chính: `runwayml/stable-diffusion-inpainting`.
-- Có các refiner mode:
-  - `lcm`
-  - `hypersd`
-  - `dpm++`
-  - `euler`
-  - `base`
-- Có hỗ trợ LCM LoRA và Hyper-SD LoRA.
-- Có optional cloth-type LoRA qua `CLOTH_LORA_MAP`.
-- Có tối ưu cho máy VRAM thấp:
-  - attention slicing
-  - VAE slicing
-  - VAE tiling
-  - model CPU offload
-  - channels-last cho UNet khi dùng CUDA
-- Mặc định inference size 512 để phù hợp máy yếu hơn; dress có thể tăng bằng `VTON_DRESS_INFER`.
-- Có cơ chế clamp/sanitize NaN, Inf và ảnh đầu vào trước khi đưa vào diffusion.
-
-### 8. Lưu trữ, cache và debug
-
-- Đã tách cấu hình lưu trữ vào `src/storage.py`.
-- Mặc định lưu toàn bộ dữ liệu tại:
-
-```text
-E:/virtual_try_on_data
+```
+vitrual try on/
+├── app.py                       # try_on orchestrator + Gradio UI legacy
+├── server.py                    # FastAPI unified server
+├── requirements.txt
+├── src/
+│   ├── pipelines/dress_pipeline.py    # Dress Pipeline v2
+│   ├── geometry/                      # Pose-driven silhouettes
+│   ├── masks/category_mask_builder.py # Mask theo từng loại trang phục
+│   ├── occlusion/                     # Hair / hand / shoes restore
+│   ├── postprocess/                   # Color anchor, ghost removal
+│   ├── prompts/category_prompts.py    # Positive/negative theo category
+│   ├── warps/                         # TPS + affine warp helpers
+│   ├── landmarks/                     # Pose smoothing
+│   ├── gemini_prompt.py               # Gemini Vision + cache + retry
+│   ├── cloud_vton_router.py           # Cloud backend orchestrator
+│   ├── catvton_client.py
+│   ├── fal_flux_client.py
+│   ├── gen_tryon.py                   # SD Inpaint refiner
+│   ├── tps_warp.py
+│   ├── image_ops.py
+│   ├── human_parsing.py               # SegFormer b2_clothes
+│   ├── garment_router.py
+│   ├── garment_silhouettes.py
+│   ├── category_lock.py
+│   └── storage.py
+├── api/                          # NestJS shop API
+│   └── src/                      # auth · products · cart · orders
+└── web-shop/                     # React storefront + try-on UI
+    ├── src/pages/TryOn.tsx
+    ├── src/pages/{Home,ProductDetail,Cart,Checkout,Login}.tsx
+    └── src/{components,context,lib}/
 ```
 
-- Các thư mục tự tạo:
-  - `inputs`
-  - `outputs`
-  - `cache`
-  - `huggingface`
-  - `huggingface/hub`
-  - `torch`
-- Output được lưu dạng:
+---
 
-```text
-tryon_YYYYMMDD_HHMMSS.png
-```
+## Bắt đầu nhanh
 
-- Có `VTON_DEBUG=1` để lưu ảnh trung gian vào thư mục debug.
-- Cache Hugging Face và Torch được ép về ổ cấu hình để tránh đầy ổ hệ thống.
+### Yêu cầu
 
-## Kiến trúc tổng quan
+- Python **3.10+**, Node **18+**, npm
+- (Tùy chọn) GPU CUDA cho local diffusion — không bắt buộc, có CPU offload
+- (Tùy chọn) MySQL 8 cho NestJS API
 
-```text
-web-shop/ React frontend
-        |
-        | POST /api/tryon
-        v
-server.py FastAPI unified server
-        |
-        v
-app.py try_on orchestrator
-        |
-        +--> Cloud router
-        |       +--> CatVTON
-        |       +--> IDM-VTON
-        |       +--> Fal.ai FLUX
-        |       +--> Replicate
-        |
-        +--> Local fallback
-                +--> MediaPipe pose
-                +--> SegFormer human parsing
-                +--> U2Net / fallback cloth mask
-                +--> affine + TPS warp
-                +--> local SD inpainting refine
-                +--> compositing + hair overlay
-```
-
-## Công nghệ sử dụng
-
-### Backend / AI
-
-- Python
-- FastAPI
-- Gradio
-- OpenCV
-- NumPy
-- Pillow
-- MediaPipe
-- PyTorch
-- Transformers
-- Diffusers
-- Accelerate
-- Safetensors
-- PEFT
-- Fal client
-- Gradio client
-
-### Frontend
-
-- React
-- TypeScript
-- Vite
-- Tailwind CSS
-- React Router
-- Lucide React
-
-## Cài đặt
-
-### 1. Tạo môi trường Python
+### 1 · AI Pipeline + Storefront
 
 ```powershell
-cd "e:\vitrual try on"
+# Python env
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+
+# Frontend
+cd web-shop && npm install && cd ..
+
+# Chạy unified server (FastAPI + serve React build)
+python server.py
 ```
 
-Nếu muốn dùng U2Net qua `rembg`, có thể cài thêm:
+Mở `http://localhost:8000` — frontend tự build nếu chưa có `web-shop/dist`.
+
+### 2 · Dev mode (hot-reload frontend)
 
 ```powershell
-pip install rembg onnxruntime
-```
+# Terminal 1
+python server.py
 
-Nếu không cài `rembg`, project vẫn có fallback segmentation.
-
-### 2. Cài frontend
-
-```powershell
+# Terminal 2 — Vite dev proxy /api/* về :8000
 cd web-shop
+npm run dev      # http://localhost:3000
+```
+
+### 3 · NestJS Shop API (tùy chọn)
+
+```powershell
+cd api
 npm install
-cd ..
+npm run start:dev   # http://localhost:3000 (API) — đổi port nếu trùng Vite
 ```
 
-## Cách chạy
+---
 
-### Chạy full-stack bằng một server
+## Cấu hình môi trường
 
-```powershell
-python server.py
-```
-
-Server sẽ chạy tại:
-
-```text
-http://localhost:8000
-```
-
-Các đường dẫn chính:
-
-- Frontend: `http://localhost:8000`
-- Try-on page: `http://localhost:8000/try-on`
-- API: `http://localhost:8000/api/tryon`
-- Health check: `http://localhost:8000/api/health`
-
-### Chạy frontend dev server
-
-Trong terminal 1:
-
-```powershell
-python server.py
-```
-
-Trong terminal 2:
-
-```powershell
-cd web-shop
-npm run dev
-```
-
-Vite chạy ở:
-
-```text
-http://localhost:3000
-```
-
-`vite.config.ts` đã proxy `/api/tryon` về `http://127.0.0.1:8000`.
-
-### Chạy Gradio standalone
-
-```powershell
-python app.py
-```
-
-Mở:
-
-```text
-http://127.0.0.1:7860
-```
-
-## Biến môi trường quan trọng
-
-Có thể tạo file `.env` dựa trên `.env.example`.
-
-### Storage và cache
+Tạo `.env` ở thư mục gốc:
 
 ```env
+# Storage — ép tất cả cache về ổ chuyên dụng
 VTO_BASE_DIR=E:/virtual_try_on_data
 HF_HOME=E:/virtual_try_on_data/huggingface
 HUGGINGFACE_HUB_CACHE=E:/virtual_try_on_data/huggingface/hub
 TORCH_HOME=E:/virtual_try_on_data/torch
-```
 
-### Cloud backend
-
-```env
+# Cloud VTON
 HF_TOKEN=
-HUGGINGFACEHUB_API_TOKEN=
-CATVTON_SPACES=FIT-Check/CatVTON,Nymbo/CatVTON,Shad0ws/CatVTON,hungdang1610/CatVTON
+CATVTON_SPACES=FIT-Check/CatVTON,Nymbo/CatVTON,Shad0ws/CatVTON
 IDMVTON_SPACE=yisol/IDM-VTON
 FAL_KEY=
-FAL_API_KEY=
 FAL_FLUX_LORA_PATH=https://huggingface.co/fal/flux-klein-9b-virtual-tryon-lora/resolve/main/flux-klein-tryon.safetensors
 REPLICATE_API_TOKEN=
-REPLICATE_VTON_MODEL=cuuupid/idm-vton:latest
-VTON_BACKEND_COOLDOWN_SECONDS=300
 VTON_CLOUD_TIMEOUT=600
-```
+VTON_BACKEND_COOLDOWN_SECONDS=300
 
-### Local diffusion
+# Gemini Vision auto-prompt
+GEMINI_API_KEY=
+GEMINI_MODEL=gemini-2.5-flash
+GEMINI_MODEL_FALLBACK=gemini-2.5-flash-lite
+VTON_USE_GEMINI_PROMPT=1
+VTON_GEMINI_MAX_RETRIES=3
+VTON_GEMINI_BASE_DELAY=1.2
+VTON_GEMINI_MAX_DELAY=12
+VTON_GEMINI_CACHE=E:/virtual_try_on_data/cache/gemini
 
-```env
+# Local SD
 HYPERSD_CKPT=Hyper-SD15-8steps-CFG-lora.safetensors
-CLOTH_LORA_MAP=
-CLOTH_LORA_SCALE=0.65
-VTON_FORCE_FP32=0
 VTON_CPU_OFFLOAD=1
 VTON_DRESS_INFER=0
-VTON_DRESS_FAST_REFINER=0
-VTON_DRESS_DIFFUSION_PRIMARY=0
-VTON_POST_HAIR_RED_CLEAN=0
+
+# Dress Pipeline v2 (1 = bật, mặc định)
+VTON_DRESS_PIPELINE_V2=1
+
+# Debug
+VTON_DEBUG=0
 ```
 
-### Debug
+---
 
-```env
-VTON_DEBUG=1
+## API
+
+### `POST /api/tryon`
+
+**Multipart fields**
+
+| Field | Type | Mặc định | Ghi chú |
+|---|---|---|---|
+| `person` | file | — | Ảnh người mẫu |
+| `cloth` | file | — | Ảnh trang phục |
+| `cloth_type` | string | `auto` | `auto` · `top` · `hoodie` · `jacket` · `pants` · `jeans` · `dress` · `skirt` · `accessory` |
+| `prompt_mode` | string | `auto` | `auto` · `fallback` · `manual` |
+| `use_catvton_cloud` | bool | `true` | `false` = bắt buộc local SD |
+| `use_gemini_prompt` | bool | `true` | Bật Gemini Vision (chỉ tác dụng khi `prompt_mode=auto`) |
+| `style_prompt` | string | `""` | Prompt thủ công, dùng nguyên trong `manual` mode |
+| `fit_scale` · `alpha` · `y_offset` | float | preset theo category | Tinh chỉnh fit |
+| `gen_steps` · `gen_guidance` · `preserve_strength` | num | preset | Tham số diffusion |
+| `quality_preset` | string | `hq` | `fast` · `balanced` · `hq` |
+| `refiner_mode` | string | `dpm++` | `lcm` · `hypersd` · `dpm++` · `euler` · `base` |
+
+**Response**: ảnh PNG. Metadata trong headers: `X-Pipeline-Info`, `X-Backend`, `X-Warning`, `X-Info`.
+
+### `POST /api/tryon/describe`
+
+Nhận `person` + `cloth`, trả JSON envelope từ Gemini (hoặc category fallback khi Gemini không khả dụng):
+
+```json
+{
+  "category": "hoodie",
+  "cloth_type": "upper",
+  "sleeve_type": "long",
+  "neckline": "hood",
+  "fit": "regular",
+  "silhouette": "fitted",
+  "fabric": "cotton fleece",
+  "color": "heather grey",
+  "positive_prompt": "…",
+  "negative_prompt": "…"
+}
 ```
 
-## Cấu trúc mã nguồn
+### `GET /api/health`
 
-```text
-.
-├── app.py                       # Orchestrator pipeline + Gradio UI
-├── server.py                    # FastAPI server + serve React build
-├── requirements.txt             # Python dependencies
-├── .env.example                 # Mẫu cấu hình môi trường
-├── src/
-│   ├── image_ops.py             # Pose, mask, erase, blend, prefit utilities
-│   ├── human_parsing.py         # SegFormer human parsing
-│   ├── tps_warp.py              # Affine/TPS warp, garment/pants/dress logic
-│   ├── gen_tryon.py             # Stable Diffusion inpainting refiner
-│   ├── cloud_vton_router.py     # Cloud backend router/fallback
-│   ├── catvton_client.py        # CatVTON client
-│   ├── fal_flux_client.py       # Fal.ai FLUX client
-│   └── storage.py               # Output/cache path management
-└── web-shop/
-    ├── package.json
-    ├── vite.config.ts
-    └── src/
-        ├── App.tsx
-        ├── pages/
-        │   ├── Home.tsx
-        │   ├── ProductDetail.tsx
-        │   ├── TryOn.tsx
-        │   └── Cart.tsx
-        ├── components/
-        │   ├── Navbar.tsx
-        │   ├── Footer.tsx
-        │   └── ProductCard.tsx
-        ├── context/
-        │   └── CartContext.tsx
-        └── data/
-            └── products.ts
+Health check.
+
+### `POST /api/tryon/recommend`
+
+Stylist AI — nhận ảnh kết quả thử đồ + `category` / `occasion` / `style`, gọi Gemini Vision và trả gợi ý phối đồ. Luôn trả 200 (có fallback theo category khi Gemini lỗi).
+
+**Multipart fields**
+
+| Field | Type | Mặc định | Ghi chú |
+|---|---|---|---|
+| `result` | file | — | Ảnh PNG/JPG từ `/api/tryon` |
+| `category` | string | `garment` | `dress` · `skirt` · `hoodie` · `top` · `jacket` · `pants` · `jeans` · `shorts` … |
+| `occasion` | string | `casual` | `đi học` · `đi làm` · `đi chơi` · `hẹn hò` · `dự tiệc` · `du lịch` … |
+| `style` | string | `minimal` | `nữ tính` · `streetwear` · `công sở` · `sang trọng` · `Hàn Quốc` · `vintage` … |
+
+**Response**
+
+```json
+{
+  "success": true,
+  "recommendation": {
+    "main_color": "be",
+    "garment_type": "váy liền thân",
+    "suitable_colors": ["trắng", "kem", "nâu", "đen"],
+    "avoid_colors": ["xanh neon", "cam chói"],
+    "recommended_items": [
+      {"type": "shoes", "name": "giày búp bê kem", "reason": "hợp tông, nữ tính"},
+      {"type": "bag", "name": "túi nhỏ màu nâu", "reason": "tạo điểm nhấn vừa đủ"}
+    ],
+    "style_summary": "Thanh lịch, phù hợp đi làm hoặc gặp mặt.",
+    "short_tip": "Phối giày kem + túi nâu + phụ kiện vàng nhạt.",
+    "source": "gemini"
+  }
+}
 ```
 
-## API `/api/tryon`
+`source` có thể là `gemini` · `cache` · `fallback`. Khi Gemini lỗi, response có thêm `warning` mô tả lý do.
 
-Endpoint nhận `multipart/form-data`.
+---
 
-### File inputs
+## Pipeline AI — chi tiết kỹ thuật
 
-- `person`: ảnh người mẫu.
-- `cloth`: ảnh trang phục.
+### Cloud router (`src/cloud_vton_router.py`)
 
-### Form fields
+```
+CatVTON multi-space → IDM-VTON → Fal.ai FLUX Klein → Replicate
+        │                                              │
+        └── cooldown 5 phút khi backend báo lỗi GPU ───┘
+```
 
-- `fit_scale`
-- `alpha`
-- `y_offset`
-- `use_gen`
-- `style_prompt`
-- `gen_steps`
-- `gen_guidance`
-- `preserve_strength`
-- `quality_preset`
-- `refiner_mode`
-- `cloth_type`
-- `use_catvton_cloud`
+### Local CPU geometric
 
-Response thành công là ảnh PNG. Metadata nằm trong response headers.
+`SegFormer b2_clothes` parse 18 nhãn → `MediaPipe` pose → smoothing → `U2Net` (rembg) hoặc fallback threshold + GrabCut → đo vai/hông → prefit scale → affine + TPS warp + sleeve warp theo pose → soft mask blend với hair overlay.
 
-## Lưu ý chất lượng input
+### Local SD-Inpaint (`src/gen_tryon.py`)
 
-Để kết quả ổn định hơn:
+- Base: `runwayml/stable-diffusion-inpainting`
+- Refiner: `lcm` / `hypersd` / `dpm++` / `euler` / `base`
+- LoRA: HyperSD, LCM, optional `CLOTH_LORA_MAP` theo loại trang phục
+- Low-VRAM: attention slicing, VAE slicing/tiling, CPU offload, channels-last UNet
 
-- Ảnh người nên rõ vai, hông và tay.
-- Tránh pose quá nghiêng hoặc crop mất phần thân.
-- Ảnh trang phục nên nền sạch, ít nhăn mạnh, thấy rõ cổ áo, tay áo và gấu áo.
-- Với quần hoặc váy/dress, ảnh người nên có đủ phần hông và chân.
-- Cloud backend cần internet và có thể phụ thuộc trạng thái GPU của Hugging Face Spaces.
-- Local diffusion lần đầu sẽ tải model, thời gian chạy phụ thuộc GPU/CPU.
+### Category-aware masks (`src/masks/category_mask_builder.py`)
 
-## Hướng phát triển tiếp theo
+Mỗi `category × subtype` có pipeline mask khác nhau. Ví dụ **hoodie**:
 
-- Sửa encoding tiếng Việt trong một số file frontend đang bị hiển thị mojibake khi đọc bằng PowerShell mặc định.
-- Bổ sung test tự động cho API và các helper xử lý mask/warp.
-- Chuẩn hóa `.env.example` để bao phủ toàn bộ biến cloud hiện đang dùng.
-- Thêm queue/job status cho request try-on dài thay vì chờ một HTTP request đơn.
-- Thêm upload thật cho catalog sản phẩm thay vì dữ liệu mock trong `products.ts`.
-- Tối ưu UX trạng thái cloud fallback để người dùng biết backend nào đang chạy.
-- Tinh chỉnh riêng cho từng loại trang phục: áo khoác, hoodie, váy dài, quần short và jeans.
+- Bỏ `left_arm`/`right_arm` khỏi semantic union (tránh phình cánh tay trần)
+- Pose envelope cap về `dilate-5px` của TPS warp
+- `MORPH_OPEN 5×5` lên garment_mask để xóa kink tay áo
+- Hard cap cuối: `human_prior &= dilate(garment_mask, 7)`
+
+### Gemini prompt với retry (`src/gemini_prompt.py`)
+
+```
+analyze_garment_prompt_with_gemini
+  ├── SHA256 cache hit? → return ngay
+  ├── retry exponential backoff (1.2s → 12s, jitter)
+  │      ├── primary  : gemini-2.5-flash
+  │      └── fallback : gemini-2.5-flash-lite
+  └── on exhaust → caller dùng fallback_describe_garment(category)
+```
+
+### Stylist AI — gợi ý phối đồ (`src/gemini_recommend.py`)
+
+Endpoint `POST /api/tryon/recommend` được tách riêng khỏi `/api/tryon` để Gemini latency không block luồng generate (user bấm thêm nút "Gợi ý phối đồ" sau khi đã có ảnh).
+
+```
+recommend_outfit_with_gemini(result_rgb, category, occasion, style)
+  ├── SHA256 cache key = hash(image) | category | occasion | style | model
+  ├── prompt Tiếng Việt yêu cầu JSON schema:
+  │     main_color · garment_type · suitable_colors[] · avoid_colors[]
+  │     recommended_items[{type, name, reason}] · style_summary · short_tip
+  ├── retry + fallback model (giống gemini_prompt)
+  └── on failure → fallback_recommendation(category) trả gợi ý mặc định
+                   theo dress/skirt · hoodie/top/jacket · pants/jeans/shorts
+```
+
+Frontend (`web-shop/src/pages/TryOn.tsx`) render card "Stylist AI" với 2 dropdown (occasion · style), nút "Gợi ý phối đồ", 3 `InfoTile` (màu chính · loại trang phục · nguồn), chip palette nên/không nên phối, grid item gợi ý và tip ngắn.
+
+### Dress Pipeline v2 (`src/pipelines/dress_pipeline.py`)
+
+Luồng độc lập cho váy, gated bằng `VTON_DRESS_PIPELINE_V2=1`:
+
+1. Parse + pose
+2. Phân tích silhouette/length/sleeve
+3. Pose-driven `target_silhouette` từ width curve
+4. Agnostic mask = silhouette ∪ old_clothes ∪ hair_underlap − face − hair_front − shoes
+5. Seed bằng Telea inpaint (không flat-color fill)
+6. Cloud/local diffusion
+7. Restore occluders + ghost removal
+
+---
+
+## Tip kết quả tốt
+
+- Ảnh người: vai/hông rõ, đứng thẳng, ánh sáng đều
+- Ảnh trang phục: nền sạch, thấy rõ cổ áo, tay áo, gấu áo
+- Hoodie: chọn `cloth_type=hoodie` để kích hoạt mask + prompt riêng
+- Váy dài: bật `VTON_DRESS_INFER=768` nếu có GPU ≥ 8GB
+- Cloud failing? → đổi `use_catvton_cloud=false` để chạy local
+
+---
+
+## Debug
+
+```powershell
+$env:VTON_DEBUG="1"; python server.py
+```
+
+Mỗi request tạo `debug_out/<timestamp>_*.png` cho từng giai đoạn pipeline.
+
+---
+
+## Roadmap
+
+- [ ] Job queue + WebSocket progress thay cho HTTP blocking
+- [ ] Upload thật + CMS cho catalog (thay `products.ts` mock)
+- [ ] A/B telemetry giữa cloud backends
+- [ ] Test suite cho mask builder + warp helpers
+- [ ] Trang admin/seller hoàn thiện trong NestJS
+- [ ] Đóng gói Docker compose 3 service (Python · Nest · MySQL)
+
+---
+
+## License
+
+Đồ án tốt nghiệp — sử dụng cho mục đích học thuật.

@@ -34,7 +34,11 @@ def _get_client(space: str) -> Client:
     key = f"{space}:{HF_TOKEN or ''}"
     if key not in _CLIENT_CACHE:
         if HF_TOKEN:
-            _CLIENT_CACHE[key] = Client(space, hf_token=HF_TOKEN)
+            # gradio_client >= 1.0 deprecated hf_token in favour of token.
+            try:
+                _CLIENT_CACHE[key] = Client(space, hf_token=HF_TOKEN)
+            except TypeError:
+                _CLIENT_CACHE[key] = Client(space, token=HF_TOKEN)
         else:
             _CLIENT_CACHE[key] = Client(space)
     return _CLIENT_CACHE[key]
@@ -95,6 +99,50 @@ def _catvton_tryon(
         raise CloudVTONUnavailableError(f"{backend}: {message}") from exc
 
 
+# ── Tier 1b: Kwai-Kolors Virtual Try-On (free public space) ───────
+
+def _kolors_tryon(
+    person_image_path: str | Path,
+    cloth_image_path: str | Path,
+    seed: int,
+) -> Path:
+    """Kwai-Kolors/Kolors-Virtual-Try-On HF Space — popular free try-on
+    space.  Used as an additional Tier 1 fallback when CatVTON spaces
+    are paused.  Takes raw person + garment images; no garment description
+    needed.
+    """
+    space = os.getenv("KOLORS_SPACE", "Kwai-Kolors/Kolors-Virtual-Try-On")
+    backend = f"kolors:{space}"
+    if _in_cooldown(backend):
+        raise CloudVTONUnavailableError(f"{backend} in cooldown")
+
+    person_path = str(Path(person_image_path).resolve())
+    cloth_path = str(Path(cloth_image_path).resolve())
+
+    try:
+        client = _get_client(space)
+        result = client.predict(
+            handle_file(person_path),
+            handle_file(cloth_path),
+            int(seed),
+            True,
+            api_name="/tryon",
+        )
+        # Result is typically (out_image_path, masked_image_path) or single path
+        if isinstance(result, (list, tuple)) and len(result) >= 1:
+            output_path = result[0]
+        else:
+            output_path = result
+        if isinstance(output_path, dict):
+            output_path = output_path.get("path") or output_path.get("url")
+        return Path(str(output_path))
+    except Exception as exc:
+        message = str(exc)
+        if _should_cooldown(message):
+            _mark_cooldown(backend)
+        raise CloudVTONUnavailableError(f"{backend}: {message}") from exc
+
+
 # ── Tier 2: IDM-VTON ──────────────────────────────────────────────
 
 def _idm_tryon(
@@ -122,25 +170,39 @@ def _idm_tryon(
     if not garment_description.strip():
         garment_description = "a realistic top garment"
 
-    try:
-        output_path, _ = _get_client(space).predict(
-            **{
-                "dict": person_editor_value,
-                "garm_img": handle_file(cloth_path),
-                "garment_des": garment_description,
-                "is_checked": True,
-                "is_checked_crop": False,
-                "denoise_steps": float(max(20, min(40, denoise_steps))),
-                "seed": float(seed),
-                "api_name": "/tryon",
-            }
-        )
-        return Path(output_path)
-    except Exception as exc:
-        message = str(exc)
-        if _should_cooldown(message):
-            _mark_cooldown(backend)
-        raise CloudVTONUnavailableError(f"{backend}: {message}") from exc
+    attempts = int(os.getenv("IDMVTON_RETRY", "2"))
+    last_exc: Exception | None = None
+    for attempt in range(max(1, attempts)):
+        try:
+            output_path, _ = _get_client(space).predict(
+                **{
+                    "dict": person_editor_value,
+                    "garm_img": handle_file(cloth_path),
+                    "garment_des": garment_description,
+                    "is_checked": True,
+                    "is_checked_crop": False,
+                    "denoise_steps": float(max(20, min(40, denoise_steps))),
+                    "seed": float(seed),
+                    "api_name": "/tryon",
+                }
+            )
+            return Path(output_path)
+        except Exception as exc:
+            last_exc = exc
+            message = str(exc)
+            # Cold-start retry only for transient RuntimeError; permanent
+            # failures (RUNTIME_ERROR / PAUSED / BUILD_ERROR) cooldown immediately.
+            if _should_cooldown(message):
+                _mark_cooldown(backend)
+                break
+            if attempt < attempts - 1 and ("RuntimeError" in message
+                                           or "queue" in message.lower()
+                                           or "timed out" in message.lower()):
+                time.sleep(8.0)
+                continue
+            break
+    assert last_exc is not None
+    raise CloudVTONUnavailableError(f"{backend}: {last_exc}") from last_exc
 
 
 # ── Tier 3: Fal.ai FLUX Klein 9B ──────────────────────────────────
@@ -250,6 +312,20 @@ def generate_with_cloud_router(
         ), "CatVTON Cloud"
     except CloudVTONUnavailableError as exc:
         errors.append(str(exc))
+
+    # Tier 1b: Kwai-Kolors (disabled — public Gradio API removed by space owner;
+    # `c.view_api()` reports 0 named/unnamed endpoints, predict() raises
+    # "Cannot find a function with api_name: /tryon". Re-enable with
+    # VTON_ENABLE_KOLORS=1 if the upstream space restores the API.
+    if os.getenv("VTON_ENABLE_KOLORS", "0").strip() == "1":
+        try:
+            return _kolors_tryon(
+                person_image_path=person_image_path,
+                cloth_image_path=cloth_image_path,
+                seed=seed,
+            ), "Kwai-Kolors Try-On"
+        except CloudVTONUnavailableError as exc:
+            errors.append(str(exc))
 
     # Tier 2: IDM-VTON (higher quality, free HF Spaces)
     try:

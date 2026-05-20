@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 import os
 from pathlib import Path
 from urllib.request import urlretrieve
@@ -22,6 +23,38 @@ POSE_TASK_MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
     "pose_landmarker_lite/float16/latest/pose_landmarker_lite.task"
 )
+
+
+def _ensure_model_cache_env() -> Path:
+    """Force model downloads/caches to VTO_BASE_DIR, defaulting to drive E."""
+    base_dir = Path(os.getenv("VTO_BASE_DIR", "E:/virtual_try_on_data")).expanduser().resolve()
+    hf_home = base_dir / "huggingface"
+    hf_hub = hf_home / "hub"
+    hf_assets = hf_home / "assets"
+    torch_home = base_dir / "torch"
+    xdg_cache_home = base_dir / "cache"
+    u2net_home = base_dir / "u2net"
+    rembg_home = base_dir / "rembg"
+    mediapipe_home = base_dir / "cache" / "mediapipe"
+
+    for directory in (hf_home, hf_hub, hf_assets, torch_home, xdg_cache_home, u2net_home, rembg_home, mediapipe_home):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    os.environ["HF_HOME"] = str(hf_home)
+    os.environ["HUGGINGFACE_HUB_CACHE"] = str(hf_hub)
+    os.environ["HF_HUB_CACHE"] = str(hf_hub)
+    os.environ["HF_ASSETS_CACHE"] = str(hf_assets)
+    os.environ["DIFFUSERS_CACHE"] = str(hf_hub)
+    os.environ["TORCH_HOME"] = str(torch_home)
+    os.environ["XDG_CACHE_HOME"] = str(xdg_cache_home)
+    os.environ["U2NET_HOME"] = str(u2net_home)
+    os.environ["REMBG_HOME"] = str(rembg_home)
+    os.environ["MEDIAPIPE_HOME"] = str(mediapipe_home)
+    os.environ.pop("TRANSFORMERS_CACHE", None)
+    return base_dir
+
+
+_ensure_model_cache_env()
 
 
 def read_image_rgb(path: str | Path) -> np.ndarray:
@@ -102,15 +135,120 @@ def _detect_full_pose_solutions(person_rgb: np.ndarray) -> dict[str, tuple[int, 
 
     return {
         "nose": _xy(PL.NOSE),
+        "left_eye_inner": _xy(PL.LEFT_EYE_INNER),
+        "left_eye": _xy(PL.LEFT_EYE),
+        "left_eye_outer": _xy(PL.LEFT_EYE_OUTER),
+        "right_eye_inner": _xy(PL.RIGHT_EYE_INNER),
+        "right_eye": _xy(PL.RIGHT_EYE),
+        "right_eye_outer": _xy(PL.RIGHT_EYE_OUTER),
+        "left_ear": _xy(PL.LEFT_EAR),
+        "right_ear": _xy(PL.RIGHT_EAR),
+        "mouth_left": _xy(PL.MOUTH_LEFT),
+        "mouth_right": _xy(PL.MOUTH_RIGHT),
         "left_shoulder": _xy(PL.LEFT_SHOULDER),
         "right_shoulder": _xy(PL.RIGHT_SHOULDER),
         "left_elbow": _xy(PL.LEFT_ELBOW),
         "right_elbow": _xy(PL.RIGHT_ELBOW),
         "left_wrist": _xy(PL.LEFT_WRIST),
         "right_wrist": _xy(PL.RIGHT_WRIST),
+        "left_pinky": _xy(PL.LEFT_PINKY),
+        "right_pinky": _xy(PL.RIGHT_PINKY),
+        "left_index": _xy(PL.LEFT_INDEX),
+        "right_index": _xy(PL.RIGHT_INDEX),
+        "left_thumb": _xy(PL.LEFT_THUMB),
+        "right_thumb": _xy(PL.RIGHT_THUMB),
         "left_hip": _xy(PL.LEFT_HIP),
         "right_hip": _xy(PL.RIGHT_HIP),
+        "left_knee": _xy(PL.LEFT_KNEE),
+        "right_knee": _xy(PL.RIGHT_KNEE),
+        "left_ankle": _xy(PL.LEFT_ANKLE),
+        "right_ankle": _xy(PL.RIGHT_ANKLE),
+        "left_heel": _xy(PL.LEFT_HEEL),
+        "right_heel": _xy(PL.RIGHT_HEEL),
+        "left_foot_index": _xy(PL.LEFT_FOOT_INDEX),
+        "right_foot_index": _xy(PL.RIGHT_FOOT_INDEX),
     }
+
+
+_DRESS_POSE_KEYS = (
+    "nose", "left_ear", "right_ear",
+    "left_shoulder", "right_shoulder",
+    "left_elbow", "right_elbow",
+    "left_wrist", "right_wrist",
+    "left_hip", "right_hip",
+    "left_knee", "right_knee",
+    "left_ankle", "right_ankle",
+    "left_heel", "right_heel",
+    "left_foot_index", "right_foot_index",
+)
+
+
+def detect_dress_pose(
+    person_rgb: np.ndarray,
+    *,
+    visibility_threshold: float = 0.35,
+) -> dict[str, tuple[int, int] | float]:
+    """High-accuracy pose for the dress pipeline.
+
+    Uses MediaPipe `model_complexity=2` (heavy) and returns only keypoints with
+    visibility above `visibility_threshold` so the dress mask builder can rely
+    on what it sees and mirror what's missing. Visibility scores are also
+    stored under `{key}_v` so callers can inspect them.
+
+    Returns a dict that:
+    - sets each landmark name to `(x, y)` when reliable, otherwise `None`
+    - sets `f"{name}_v"` to the float visibility score (0..1)
+    """
+    if not hasattr(mp, "solutions"):
+        # Tasks API fallback returns no visibility — fall back gracefully.
+        return _detect_full_pose_tasks(person_rgb)  # type: ignore[return-value]
+
+    height, width = person_rgb.shape[:2]
+    with mp.solutions.pose.Pose(
+        static_image_mode=True,
+        model_complexity=2,
+        enable_segmentation=False,
+        min_detection_confidence=0.6,
+        min_tracking_confidence=0.6,
+    ) as pose:
+        result = pose.process(person_rgb)
+    if not result.pose_landmarks:
+        raise ValueError("Không tìm thấy pose. Hãy dùng ảnh rõ toàn thân.")
+    lm = result.pose_landmarks.landmark
+    PL = mp.solutions.pose.PoseLandmark
+
+    def _pt(lid) -> tuple[tuple[int, int], float]:
+        p = lm[lid]
+        return (int(p.x * width), int(p.y * height)), float(getattr(p, "visibility", 1.0))
+
+    name_to_id = {
+        "nose": PL.NOSE,
+        "left_ear": PL.LEFT_EAR,
+        "right_ear": PL.RIGHT_EAR,
+        "left_shoulder": PL.LEFT_SHOULDER,
+        "right_shoulder": PL.RIGHT_SHOULDER,
+        "left_elbow": PL.LEFT_ELBOW,
+        "right_elbow": PL.RIGHT_ELBOW,
+        "left_wrist": PL.LEFT_WRIST,
+        "right_wrist": PL.RIGHT_WRIST,
+        "left_hip": PL.LEFT_HIP,
+        "right_hip": PL.RIGHT_HIP,
+        "left_knee": PL.LEFT_KNEE,
+        "right_knee": PL.RIGHT_KNEE,
+        "left_ankle": PL.LEFT_ANKLE,
+        "right_ankle": PL.RIGHT_ANKLE,
+        "left_heel": PL.LEFT_HEEL,
+        "right_heel": PL.RIGHT_HEEL,
+        "left_foot_index": PL.LEFT_FOOT_INDEX,
+        "right_foot_index": PL.RIGHT_FOOT_INDEX,
+    }
+
+    out: dict[str, tuple[int, int] | float | None] = {}
+    for name, lid in name_to_id.items():
+        xy, vis = _pt(lid)
+        out[f"{name}_v"] = vis
+        out[name] = xy if vis >= visibility_threshold else None
+    return out  # type: ignore[return-value]
 
 
 def _detect_pose_with_tasks(person_rgb: np.ndarray) -> PoseBox:
@@ -178,16 +316,27 @@ def _detect_full_pose_tasks(person_rgb: np.ndarray) -> dict[str, tuple[int, int]
 
     return {
         "nose": _xy(0),
+        "left_eye_inner": _xy(1), "left_eye": _xy(2), "left_eye_outer": _xy(3),
+        "right_eye_inner": _xy(4), "right_eye": _xy(5), "right_eye_outer": _xy(6),
+        "left_ear": _xy(7), "right_ear": _xy(8),
+        "mouth_left": _xy(9), "mouth_right": _xy(10),
         "left_shoulder": _xy(11), "right_shoulder": _xy(12),
         "left_elbow": _xy(13), "right_elbow": _xy(14),
         "left_wrist": _xy(15), "right_wrist": _xy(16),
+        "left_pinky": _xy(17), "right_pinky": _xy(18),
+        "left_index": _xy(19), "right_index": _xy(20),
+        "left_thumb": _xy(21), "right_thumb": _xy(22),
         "left_hip": _xy(23), "right_hip": _xy(24),
+        "left_knee": _xy(25), "right_knee": _xy(26),
+        "left_ankle": _xy(27), "right_ankle": _xy(28),
+        "left_heel": _xy(29), "right_heel": _xy(30),
+        "left_foot_index": _xy(31), "right_foot_index": _xy(32),
     }
 
 
 def _ensure_pose_task_model() -> Path:
-    base_dir = Path(os.getenv("VTO_BASE_DIR", "E:/virtual_try_on_data"))
-    model_dir = base_dir / "cache" / "mediapipe"
+    base_dir = _ensure_model_cache_env()
+    model_dir = Path(os.getenv("MEDIAPIPE_HOME", str(base_dir / "cache" / "mediapipe")))
     model_dir.mkdir(parents=True, exist_ok=True)
 
     model_path = model_dir / "pose_landmarker_lite.task"
@@ -738,6 +887,7 @@ def segment_cloth_u2net(cloth_rgb: np.ndarray) -> np.ndarray:
 
     Falls back to threshold+GrabCut if rembg is not installed.
     """
+    _ensure_model_cache_env()
     try:
         from rembg import remove
         from PIL import Image
@@ -767,6 +917,209 @@ def segment_cloth_u2net(cloth_rgb: np.ndarray) -> np.ndarray:
 
 
 # ── Pose landmark smoothing ────────────────────────────────────────────
+
+def _clean_garment_mask(mask: np.ndarray, image_shape: tuple[int, int]) -> np.ndarray:
+    """Normalize garment foreground mask without over-expanding the silhouette."""
+    h, w = image_shape
+    if mask.shape[:2] != (h, w):
+        mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_LINEAR)
+
+    mask = np.nan_to_num(mask.astype(np.float32), nan=0.0, posinf=255.0, neginf=0.0)
+    mask = (np.clip(mask, 0, 255) > 127).astype(np.uint8) * 255
+
+    k3 = np.ones((3, 3), np.uint8)
+    k5 = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k5, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k3, iterations=1)
+
+    inv = cv2.bitwise_not(mask)
+    flood = inv.copy()
+    flood_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+    cv2.floodFill(flood, flood_mask, (0, 0), 0)
+    holes = flood > 0
+    if holes.any():
+        num, labels, stats, _ = cv2.connectedComponentsWithStats(holes.astype(np.uint8), 8)
+        max_hole_area = max(80, int(h * w * 0.010))
+        for idx in range(1, num):
+            if int(stats[idx, cv2.CC_STAT_AREA]) <= max_hole_area:
+                mask[labels == idx] = 255
+
+    num, labels, stats, _ = cv2.connectedComponentsWithStats((mask > 0).astype(np.uint8), 8)
+    if num > 1:
+        areas = stats[1:, cv2.CC_STAT_AREA]
+        if len(areas):
+            largest = int(areas.max())
+            keep = np.zeros_like(mask)
+            min_area = max(64, int(largest * 0.015))
+            for idx in range(1, num):
+                if int(stats[idx, cv2.CC_STAT_AREA]) >= min_area:
+                    keep[labels == idx] = 255
+            mask = keep
+
+    return ((mask > 127).astype(np.uint8)) * 255
+
+
+@lru_cache(maxsize=1)
+def _get_rmbg2_model():
+    """Load BRIA RMBG-2.0 once per process."""
+    _ensure_model_cache_env()
+    import torch
+    from transformers import AutoModelForImageSegmentation
+
+    requested = os.getenv("VTON_RMBG2_DEVICE", "").strip().lower()
+    if requested in {"cpu", "cuda"}:
+        device = requested if requested == "cpu" or torch.cuda.is_available() else "cpu"
+    else:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    model_id = os.getenv("VTON_RMBG2_MODEL", "briaai/RMBG-2.0").strip() or "briaai/RMBG-2.0"
+    try:
+        cache_dir = os.getenv("HF_HUB_CACHE") or os.getenv("HUGGINGFACE_HUB_CACHE")
+        model = AutoModelForImageSegmentation.from_pretrained(
+            model_id,
+            trust_remote_code=True,
+            dtype="auto",
+            cache_dir=cache_dir,
+        )
+    except TypeError:
+        model = AutoModelForImageSegmentation.from_pretrained(
+            model_id,
+            trust_remote_code=True,
+            cache_dir=os.getenv("HF_HUB_CACHE") or os.getenv("HUGGINGFACE_HUB_CACHE"),
+        )
+    model.to(device)
+    model.eval()
+    return model, device
+
+
+def segment_cloth_rmbg2(cloth_rgb: np.ndarray) -> np.ndarray:
+    """BRIA RMBG-2.0 foreground mask for garment product images."""
+    import torch
+    from PIL import Image
+
+    model, device = _get_rmbg2_model()
+
+    image = Image.fromarray(cloth_rgb).convert("RGB")
+    orig_w, orig_h = image.size
+    infer_size = int(os.getenv("VTON_RMBG2_SIZE", "1024"))
+    infer_size = max(512, min(infer_size, 1536))
+    resized = image.resize((infer_size, infer_size), Image.BILINEAR)
+
+    arr = np.asarray(resized).astype(np.float32) / 255.0
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+    arr = (arr - mean[None, None, :]) / std[None, None, :]
+    input_tensor = torch.from_numpy(arr.transpose(2, 0, 1)).unsqueeze(0).to(device)
+
+    with torch.inference_mode():
+        preds = model(input_tensor)[-1].sigmoid().detach().cpu().float()
+
+    pred = preds[0].squeeze().numpy()
+    pred = cv2.resize(pred, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+    threshold = float(os.getenv("VTON_RMBG2_THRESH", "0.50"))
+    mask = (pred > threshold).astype(np.uint8) * 255
+    return _clean_garment_mask(mask, cloth_rgb.shape[:2])
+
+
+def _mask_bbox(mask: np.ndarray, pad_ratio: float = 0.04) -> np.ndarray | None:
+    ys, xs = np.where(mask > 20)
+    if len(xs) < 50:
+        return None
+    h, w = mask.shape[:2]
+    x1, x2 = int(xs.min()), int(xs.max())
+    y1, y2 = int(ys.min()), int(ys.max())
+    pad = int(max(x2 - x1 + 1, y2 - y1 + 1) * pad_ratio)
+    return np.array([
+        max(0, x1 - pad),
+        max(0, y1 - pad),
+        min(w - 1, x2 + pad),
+        min(h - 1, y2 + pad),
+    ], dtype=np.float32)
+
+
+@lru_cache(maxsize=1)
+def _get_sam2_predictor():
+    """Load SAM2 predictor if package/checkpoint are available."""
+    import torch
+    from sam2.build_sam import build_sam2
+    from sam2.sam2_image_predictor import SAM2ImagePredictor
+
+    checkpoint = os.getenv("VTON_SAM2_CHECKPOINT", "").strip()
+    model_cfg = os.getenv("VTON_SAM2_CONFIG", "sam2_hiera_l.yaml").strip()
+    if not checkpoint:
+        raise RuntimeError("VTON_SAM2_CHECKPOINT is not set")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = build_sam2(model_cfg, checkpoint, device=device)
+    return SAM2ImagePredictor(model)
+
+
+def segment_cloth_sam2_refine(cloth_rgb: np.ndarray, rough_mask: np.ndarray) -> np.ndarray:
+    """Optional SAM2 box-refinement for an existing garment mask."""
+    predictor = _get_sam2_predictor()
+    box = _mask_bbox(rough_mask)
+    if box is None:
+        return rough_mask
+    predictor.set_image(cloth_rgb)
+    masks, scores, _logits = predictor.predict(
+        box=box,
+        multimask_output=True,
+    )
+    if masks is None or len(masks) == 0:
+        return rough_mask
+    best_idx = int(np.argmax(scores)) if scores is not None and len(scores) else 0
+    sam_mask = masks[best_idx].astype(np.uint8) * 255
+    return _clean_garment_mask(sam_mask, cloth_rgb.shape[:2])
+
+
+def segment_cloth_ensemble(cloth_rgb: np.ndarray) -> np.ndarray:
+    """Garment mask ensemble: U2Net + BRIA RMBG-2.0 + optional SAM2 refine."""
+    masks: list[np.ndarray] = []
+    weights: list[float] = []
+
+    try:
+        mask_u2net = segment_cloth_u2net(cloth_rgb)
+        if mask_u2net is not None and int(mask_u2net.sum()) > 255 * 100:
+            masks.append(mask_u2net.astype(np.float32))
+            weights.append(0.45)
+    except BaseException as exc:
+        print(f"[garment_mask] U2Net unavailable: {exc}")
+
+    use_rmbg2 = os.getenv("VTON_USE_RMBG2", "1").strip().lower() not in {"0", "false", "no"}
+    if use_rmbg2:
+        try:
+            mask_rmbg = segment_cloth_rmbg2(cloth_rgb)
+            if mask_rmbg is not None and int(mask_rmbg.sum()) > 255 * 100:
+                masks.append(mask_rmbg.astype(np.float32))
+                weights.append(0.55)
+        except BaseException as exc:
+            print(f"[garment_mask] RMBG-2.0 unavailable: {exc}")
+
+    if not masks:
+        return build_cloth_mask(cloth_rgb)
+
+    weights_np = np.array(weights, dtype=np.float32)
+    weights_np = weights_np / max(1e-6, float(weights_np.sum()))
+    merged = np.zeros(cloth_rgb.shape[:2], dtype=np.float32)
+    for mask, weight in zip(masks, weights_np):
+        if mask.shape[:2] != merged.shape:
+            mask = cv2.resize(mask, (merged.shape[1], merged.shape[0]), interpolation=cv2.INTER_LINEAR)
+        merged += mask * float(weight)
+
+    mask = _clean_garment_mask((merged > 127).astype(np.uint8) * 255, cloth_rgb.shape[:2])
+
+    use_sam2 = os.getenv("VTON_USE_SAM2_GARMENT_MASK", "0").strip().lower() in {"1", "true", "yes"}
+    if use_sam2:
+        try:
+            mask_sam2 = segment_cloth_sam2_refine(cloth_rgb, mask)
+            if mask_sam2 is not None and int(mask_sam2.sum()) > 255 * 100:
+                merged = 0.80 * mask.astype(np.float32) + 0.20 * mask_sam2.astype(np.float32)
+                mask = _clean_garment_mask((merged > 127).astype(np.uint8) * 255, cloth_rgb.shape[:2])
+        except BaseException as exc:
+            print(f"[garment_mask] SAM2 refine unavailable: {exc}")
+
+    return mask
+
 
 def smooth_pose_landmarks(
     pose: dict[str, tuple[int, int]],
