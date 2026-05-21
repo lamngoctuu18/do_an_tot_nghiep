@@ -394,6 +394,92 @@ Mỗi request tạo `debug_out/<timestamp>_*.png` cho từng giai đoạn pipeli
 
 ---
 
+## Mô hình tham khảo (Reference Models)
+
+Hệ thống tổ hợp nhiều mô hình thị giác máy tính — mỗi mô hình đóng vai trò khác nhau trong pipeline:
+
+### Cloud VTON backends
+
+| Mô hình | Nhà phát hành | Vai trò trong project |
+|---|---|---|
+| **CatVTON** | Zheng-Chong / FIT-Check (HF Spaces) | Backend mặc định — diffusion-based virtual try-on, in-context attention, multi-space failover |
+| **IDM-VTON** | yisol (HF Spaces) | Backend phụ — improved diffusion, mạnh ở váy dài + áo phức tạp |
+| **FLUX Klein Try-On LoRA** | fal-ai | Cloud refiner FLUX + LoRA chuyên cho try-on |
+| **Replicate VTON** | Replicate registry | Fallback cuối cùng khi 3 backend trên busy/quota |
+
+### Local diffusion stack
+
+| Mô hình | Nhà phát hành | Vai trò |
+|---|---|---|
+| **Stable Diffusion v1.5 Inpainting** (`runwayml/stable-diffusion-inpainting`) | Runway / Stability AI | Base inpainting model cho refiner local |
+| **Hyper-SD LoRA** (`ByteDance/Hyper-SD`, 8-step CFG) | ByteDance | Tăng tốc inference còn 8 step, giữ chất lượng |
+| **LCM-LoRA** (`latent-consistency/lcm-lora-sdv1-5`) | Tsinghua / Hugging Face | Latent Consistency, preset `lcm` |
+| **IP-Adapter** (`h94/IP-Adapter`, `ip-adapter-plus_sd15`) | Tencent AI Lab | Image-prompt conditioning từ ảnh trang phục |
+| **DPM++ / Euler schedulers** | Diffusers | Refiner mode cao cấp cho preset `hq` |
+
+### Human parsing · pose · segmentation
+
+| Mô hình | Nhà phát hành | Vai trò |
+|---|---|---|
+| **SegFormer B2 Clothes** (`mattmdjaga/segformer_b2_clothes`) | Matt Mdjaga / NVIDIA SegFormer | Human parsing 18 nhãn (hair, face, upper, pants, dress…) |
+| **MediaPipe Pose** | Google MediaPipe | Pose estimation 33 keypoints, vai/hông/khớp tay |
+| **U²-Net (rembg)** (`u2net.onnx`) | Qin et al. | Garment background removal |
+| **OpenCV GrabCut** | OpenCV | Fallback segmentation khi U²-Net fail |
+
+### Vision-Language
+
+| Mô hình | Nhà phát hành | Vai trò |
+|---|---|---|
+| **Gemini 2.5 Flash / Flash-Lite** | Google DeepMind | Auto-prompt generator + Stylist AI recommend, fallback model chain |
+
+### Thuật toán cổ điển
+
+- **Thin Plate Spline (TPS) Warp** — Bookstein 1989 — warp 20 control point + symmetry, là output chính của pipeline.
+- **Telea Inpainting** (`cv2.inpaint INPAINT_TELEA`) — Telea 2004 — seed fill cho Dress Pipeline v2, ghost removal.
+- **GrabCut** — Rother et al. 2004 — fallback foreground/background extraction.
+
+---
+
+## Tài liệu tham khảo (References)
+
+### Papers
+
+1. Bookstein, F. L. (1989). *Principal Warps: Thin-Plate Splines and the Decomposition of Deformations*. IEEE PAMI 11(6).
+2. Chong, Z. et al. (2024). *CatVTON: Concatenation Is All You Need for Virtual Try-On*. arXiv:2407.15886.
+3. Choi, Y. et al. (2024). *IDM-VTON: Improving Diffusion Models for Authentic Virtual Try-on in the Wild*. ECCV 2024 / arXiv:2403.05139.
+4. Rombach, R. et al. (2022). *High-Resolution Image Synthesis with Latent Diffusion Models* (Stable Diffusion). CVPR.
+5. Xie, E. et al. (2021). *SegFormer: Simple and Efficient Design for Semantic Segmentation with Transformers*. NeurIPS.
+6. Ye, H. et al. (2023). *IP-Adapter: Text Compatible Image Prompt Adapter for Text-to-Image Diffusion Models*. arXiv:2308.06721.
+7. Luo, S. et al. (2023). *LCM-LoRA: A Universal Stable-Diffusion Acceleration Module*. arXiv:2311.05556.
+8. Ren, Y. et al. (2024). *Hyper-SD: Trajectory Segmented Consistency Model for Efficient Image Synthesis*. arXiv:2404.13686.
+9. Qin, X. et al. (2020). *U²-Net: Going Deeper with Nested U-Structure for Salient Object Detection*. Pattern Recognition.
+10. Rother, C., Kolmogorov, V., Blake, A. (2004). *GrabCut: Interactive Foreground Extraction using Iterated Graph Cuts*. ACM TOG.
+11. Telea, A. (2004). *An Image Inpainting Technique Based on the Fast Marching Method*. Journal of Graphics Tools.
+
+### Repositories & dự án nguồn
+
+- [Zheng-Chong/CatVTON](https://github.com/Zheng-Chong/CatVTON) — base implementation + HF Space.
+- [yisol/IDM-VTON](https://github.com/yisol/IDM-VTON) — improved diffusion VTON.
+- [fal-ai/flux-klein-tryon-lora](https://huggingface.co/fal/flux-klein-9b-virtual-tryon-lora) — FLUX LoRA cho try-on.
+- [huggingface/diffusers](https://github.com/huggingface/diffusers) — Stable Diffusion + Inpaint + LoRA loader.
+- [tencent-ailab/IP-Adapter](https://github.com/tencent-ailab/IP-Adapter) — image prompt adapter.
+- [ByteDance/Hyper-SD](https://huggingface.co/ByteDance/Hyper-SD) — 8-step LoRA.
+- [latent-consistency/lcm-lora-sdv1-5](https://huggingface.co/latent-consistency/lcm-lora-sdv1-5) — LCM LoRA.
+- [mattmdjaga/segformer_b2_clothes](https://huggingface.co/mattmdjaga/segformer_b2_clothes) — human parsing.
+- [google/mediapipe](https://github.com/google/mediapipe) — Pose Landmarker.
+- [danielgatis/rembg](https://github.com/danielgatis/rembg) — U²-Net inference wrapper.
+- [google-gemini/cookbook](https://github.com/google-gemini/cookbook) — Gemini Vision usage patterns.
+
+### Documentation chính thức
+
+- [PyTorch](https://pytorch.org/docs) · [Diffusers](https://huggingface.co/docs/diffusers) · [Transformers](https://huggingface.co/docs/transformers)
+- [FastAPI](https://fastapi.tiangolo.com) · [NestJS](https://docs.nestjs.com) · [TypeORM](https://typeorm.io)
+- [React](https://react.dev) · [Vite](https://vitejs.dev) · [Tailwind CSS](https://tailwindcss.com)
+- [OpenCV](https://docs.opencv.org) · [MediaPipe Solutions](https://developers.google.com/mediapipe)
+- [Google Gen AI SDK](https://ai.google.dev/gemini-api/docs)
+
+---
+
 ## License
 
 Đồ án tốt nghiệp — sử dụng cho mục đích học thuật.
