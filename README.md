@@ -383,6 +383,34 @@ Mỗi request tạo `debug_out/<timestamp>_*.png` cho từng giai đoạn pipeli
 
 ---
 
+## Cập nhật gần đây
+
+Tinh chỉnh chất lượng cho **Dress v2** và các subtype top (`jacket`, `tshirt`):
+
+### Dress v2
+
+- **Khử vệt cổ áo cũ** — telea dilation 3 → 9 px để phủ halo viền răng cưa của cổ áo trắng/sơ mi gốc; `_restore_open_neck_skin` nâng alpha 0.58 → 0.92.
+- **Vẽ lại được vùng cổ/vai** — composite alpha mở rộng ra `agnostic_mask − target_mask` ở dải ngang hẹp [-8%, +1%] quanh đỉnh váy, chỉ chấp nhận pixel "trông giống da" (r > b+4, lum 80–240, chroma < 90). Tránh dây túi/vạch tối lọt vào.
+- **Xác định vai theo váy gốc** — `src/geometry/dress_geometry.py::_shoulder_from_parsing` lấy hàng rộng nhất trong dải 22–42% phía trên `upper_clothes` parsing thay vì MediaPipe (cho kích thước vai thật, hết kéo dài cổ).
+- **Đối xứng vai khi bị che** — center theo pose-only (mũi · trung điểm vai · trung điểm hông), `pose_half_lower = |ls.x − rs.x| * 0.5` làm cận dưới cứng. Loại bỏ bias do túi xách che một bên.
+- **Hết lộ chân váy cũ** — `remove_old_dress_ghost` thêm forced inpaint pass mọi vùng bên dưới hem mới (bắt được váy sọc/đen mà mean-color filter bỏ sót); kernel close/dilate 5 → 7 px; telea radius 7.
+- **Tắt mặc định `_cleanup_offshoulder_top_band`** — gate bằng env `VTON_DRESS_TOPBAND_CLEAN` (mặc định OFF) vì cleanup này hay phủ màu vải lên da gây vệt đỏ ngang vai.
+
+### Jacket subtype
+
+- **`JacketChinCap`** — cắt mask phía trên cằm (chin_y − 1.2% h) để jacket không trườn lên hàm.
+- **`JacketHemSeal` v2** — chỉ seal khi PHÁT HIỆN khe hở ≥ 3 cột zeros giữa hai mép mask ở 28% dưới. Kernel 9×41 → 3×11. Giữ lại nét diffusion (răng zip, đường túi).
+- **IP-adapter scale 0.58 → 0.48** — nhường chỗ cho SD vẽ chi tiết vải/đường may, đỡ bị paste-y.
+- **`JacketInnerShirtRestore`** — sau diffusion, restore pixel áo trong (vd. T-shirt trắng ở cổ V) bằng `person_rgb`: dò vùng `upper_clothes` ở 32% trên có màu cách jacket > 55 (LAB-free RGB distance), loại pixel da, giữ component ≥ 80 px, erode 3×3 + Gaussian σ=1.6 cho mép mềm.
+
+### T-shirt subtype (mới)
+
+- **`TOP_TSHIRT_POSITIVE` / `_CONSTRAINT` / `_NEGATIVE_APPEND`** — khoá họa tiết/chữ in: "preserve front chest graphic exactly: identical wording, font, color, position and scale", "no extra/missing letters". `build_category_negative` xử lý nhánh `tshirt`.
+- **`TOP_NEGATIVE_APPEND` mở rộng** — thêm "garbled text, melted letters, smeared print, duplicate logo, recolored graphic, font changed…" áp dụng cho mọi top.
+- **IP-adapter scale tshirt = 0.62** — cao hơn shirt (0.52) / hoodie (0.36) để ép diffusion bám reference graphic chặt hơn.
+
+---
+
 ## Roadmap
 
 - [ ] Job queue + WebSocket progress thay cho HTTP blocking

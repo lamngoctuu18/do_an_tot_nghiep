@@ -6,6 +6,7 @@ from functools import lru_cache
 import json
 import os
 from pathlib import Path
+import traceback
 
 import cv2
 import numpy as np
@@ -307,13 +308,37 @@ def _maybe_disable_attention_slicing(pipe) -> None:
 
 
 def _mark_ip_adapter_unavailable(pipe) -> None:
-    try:
-        if hasattr(pipe, "unload_ip_adapter"):
-            pipe.unload_ip_adapter()
-    except Exception:
-        pass
+    _unload_ip_adapter_if_loaded(pipe, reason="generation failure")
     pipe._vto_ip_adapter_loaded = False
     pipe._vto_ip_adapter_failed = True
+
+
+def _unload_ip_adapter_if_loaded(pipe, *, reason: str = "") -> bool:
+    """Remove a stale IP-Adapter from the cached pipeline when this run does not use it."""
+    loaded = bool(getattr(pipe, "_vto_ip_adapter_loaded", False))
+    has_ip_projection = False
+    try:
+        unet = getattr(pipe, "unet", None)
+        enc_type = str(getattr(getattr(unet, "config", None), "encoder_hid_dim_type", "") or "").lower()
+        has_ip_projection = "ip" in enc_type and getattr(unet, "encoder_hid_proj", None) is not None
+    except Exception:
+        has_ip_projection = False
+    if not loaded and not has_ip_projection:
+        return False
+    if not hasattr(pipe, "unload_ip_adapter"):
+        pipe._vto_ip_adapter_loaded = False
+        return False
+    try:
+        pipe.unload_ip_adapter()
+        pipe._vto_ip_adapter_loaded = False
+        pipe._vto_ip_adapter_weight = None
+        suffix = f" ({reason})" if reason else ""
+        print(f"[gen_tryon] IP-Adapter unloaded{suffix}")
+        return True
+    except Exception as exc:
+        pipe._vto_ip_adapter_loaded = False
+        print(f"[gen_tryon] IP-Adapter unload warning: {exc}")
+        return False
 
 
 def _parse_lora_map() -> dict[str, str]:
@@ -510,6 +535,7 @@ def _refresh_cpu_offload_after_ip_adapter(pipe) -> None:
 def _maybe_apply_ip_adapter(pipe, reference_image_rgb: np.ndarray | None, scale: float) -> bool:
     """Load SD1.5 IP-Adapter for garment-reference conditioning when available."""
     if not _ip_adapter_enabled(reference_image_rgb):
+        _unload_ip_adapter_if_loaded(pipe, reason="disabled for current run")
         return False
     if not hasattr(pipe, "load_ip_adapter"):
         return False
@@ -714,22 +740,32 @@ def generate_tryon_image(
     # v16.10: fp32 pipeline — no NaN guard needed. Run directly.
     try:
         result = pipe(**call_kwargs)
-    except RuntimeError as exc:
-        _debug_save_text("gen_tryon_02_pipe_exception", repr(exc), debug_run_id)
+    except Exception as exc:
+        _debug_save_text("gen_tryon_02_pipe_exception", traceback.format_exc(), debug_run_id)
         retry_without_ip = (
             ip_adapter_active
             and os.getenv("VTON_IP_ADAPTER_RETRY_WITHOUT", "1").strip().lower() not in {"0", "false", "no"}
         )
+        stale_adapter_retry = (
+            (not retry_without_ip)
+            and "NoneType" in str(exc)
+            and "iterable" in str(exc)
+            and _unload_ip_adapter_if_loaded(pipe, reason="stale adapter exception")
+        )
+        retry_without_ip = retry_without_ip or stale_adapter_retry
         if not retry_without_ip:
             raise
-        print(f"[gen_tryon] IP-Adapter generation failed, retrying without it: {exc}")
-        _mark_ip_adapter_unavailable(pipe)
+        if ip_adapter_active:
+            print(f"[gen_tryon] IP-Adapter generation failed, retrying without it: {exc}")
+            _mark_ip_adapter_unavailable(pipe)
+        else:
+            print(f"[gen_tryon] Stale IP-Adapter state cleared, retrying diffusion: {exc}")
         call_kwargs.pop("ip_adapter_image", None)
         _maybe_enable_attention_slicing(pipe)
         try:
             result = pipe(**call_kwargs)
-        except RuntimeError as retry_exc:
-            _debug_save_text("gen_tryon_02_retry_exception", repr(retry_exc), debug_run_id)
+        except Exception:
+            _debug_save_text("gen_tryon_02_retry_exception", traceback.format_exc(), debug_run_id)
             raise
     output = result.images[0]
 

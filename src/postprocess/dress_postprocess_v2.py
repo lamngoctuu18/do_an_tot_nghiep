@@ -64,8 +64,11 @@ def remove_old_dress_ghost(
 ) -> tuple[np.ndarray, bool]:
     """Erase old garment leftovers outside the new dress footprint.
 
-    For pixels in (old_clothes_mask − target_mask) that still match the mean
-    old-garment colour, run Telea inpaint from surrounding non-garment pixels.
+    Two-pass: (a) the legacy colour-match pass for in-frame ghosting; (b) a
+    forced full-inpaint pass over any old-garment region that still lives
+    outside the new dress hem — this is what removes a striped/patterned
+    skirt that peeks below the new dress hem and which colour matching can
+    miss because its mean colour is far from any single pixel.
     """
     spill_zone = cv2.subtract(old_clothes_mask, cv2.dilate(target_mask, np.ones((5, 5), np.uint8), iterations=1))
     if int(spill_zone.sum()) < 255 * 30:
@@ -75,15 +78,42 @@ def remove_old_dress_ghost(
     if int(oc_bool.sum()) < 30:
         return out_rgb, False
     old_mean = person_rgb[oc_bool].astype(np.float32).mean(axis=0)
-    diff = np.linalg.norm(out_rgb.astype(np.float32) - old_mean[None, None, :], axis=2)
-    spill = ((diff < chroma_thresh) & (spill_zone > 0)).astype(np.uint8) * 255
+    out_f = out_rgb.astype(np.float32)
+    diff = np.linalg.norm(out_f - old_mean[None, None, :], axis=2)
+    near_old = diff < chroma_thresh
+
+    r, g, b = out_f[..., 0], out_f[..., 1], out_f[..., 2]
+    lum = out_f.mean(axis=2)
+    chroma = out_f.max(axis=2) - out_f.min(axis=2)
+    not_skin = ~(
+        (r > b + 6.0)
+        & (r > g - 4.0)
+        & (lum > 70.0)
+        & (lum < 235.0)
+        & (chroma < 80.0)
+    )
+    dark_or_saturated = (lum < 110.0) | ((chroma > 28.0) & not_skin)
+    garment_like = near_old | (dark_or_saturated & not_skin)
+    spill = (garment_like & (spill_zone > 0)).astype(np.uint8) * 255
+
+    # Force-inpaint pass: everything *below* the new dress hem that is still
+    # tagged as old garment, regardless of colour. Striped/patterned skirts
+    # whose pattern colours stay distinct from the mean would otherwise slip
+    # through the colour-match check above.
+    ys_t = np.where(target_mask > 20)[0]
+    if len(ys_t):
+        hem_y = int(ys_t.max())
+        below_hem = np.zeros_like(spill_zone)
+        below_hem[hem_y - 4:, :] = 255
+        forced = cv2.bitwise_and(spill_zone, below_hem)
+        spill = cv2.bitwise_or(spill, forced)
 
     if int(spill.sum()) < 255 * 20:
         return out_rgb, False
-    spill = cv2.morphologyEx(spill, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
-    spill_dilated = cv2.dilate(spill, np.ones((3, 3), np.uint8), iterations=1)
-    inpainted = cv2.inpaint(out_rgb, spill_dilated, 3, cv2.INPAINT_TELEA)
-    alpha = _soft(spill_dilated, 1.5)[..., None]
+    spill = cv2.morphologyEx(spill, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+    spill_dilated = cv2.dilate(spill, np.ones((7, 7), np.uint8), iterations=1)
+    inpainted = cv2.inpaint(out_rgb, spill_dilated, 7, cv2.INPAINT_TELEA)
+    alpha = _soft(spill_dilated, 2.0)[..., None]
     blended = out_rgb.astype(np.float32) * (1.0 - alpha) + inpainted.astype(np.float32) * alpha
     return _safe_uint8(blended), True
 
@@ -143,5 +173,9 @@ def telea_inpaint_seed(
     if int(erase_mask.sum()) < 30:
         return person_rgb.copy()
     m = (erase_mask > 0).astype(np.uint8) * 255
-    m = cv2.dilate(m, np.ones((3, 3), np.uint8), iterations=1)
+    # Wider dilation (9px) — anti-aliased garment edges (especially white shirt
+    # collars) leak past the parsing mask. If those halo pixels remain, telea
+    # samples them and a faint collar trace persists in the seed near the
+    # dress neckline.
+    m = cv2.dilate(m, np.ones((9, 9), np.uint8), iterations=1)
     return cv2.inpaint(person_rgb, m, 5, cv2.INPAINT_TELEA)

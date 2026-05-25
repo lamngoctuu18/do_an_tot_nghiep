@@ -59,12 +59,19 @@ from src.postprocess.pants_postprocess import (
     build_shorts_edit_band as _pp_build_shorts_edit_band,
     build_pants_shape_mask as _pp_build_pants_shape_mask,
     build_shorts_shape_mask as _pp_build_shorts_shape_mask,
+    build_shorts_wear_mask as _pp_build_shorts_wear_mask,
     reference_garment_color as _pp_reference_garment_color,
     render_reference_shorts as _pp_render_reference_shorts,
     apply_pants_shape_guard as _pp_apply_pants_shape_guard,
     apply_shorts_shape_guard as _pp_apply_shorts_shape_guard,
     build_pants_diffusion_seed as _pp_build_pants_diffusion_seed,
     cleanup_pants_speckles as _pp_cleanup_pants_speckles,
+    cleanup_long_pants_denim_artifacts as _pp_cleanup_long_pants_denim_artifacts,
+    restore_long_pants_ankle_skin as _pp_restore_long_pants_ankle_skin,
+    cleanup_shorts_external_spill as _pp_cleanup_shorts_external_spill,
+    cleanup_shorts_old_hem_bleed as _pp_cleanup_shorts_old_hem_bleed,
+    cleanup_shorts_upper_cloth_spill as _pp_cleanup_shorts_upper_cloth_spill,
+    cleanup_shorts_center_trim_artifact as _pp_cleanup_shorts_center_trim_artifact,
     recover_pants_texture_detail as _pp_recover_pants_texture_detail,
 )
 from src.postprocess.dress_postprocess import (
@@ -1947,7 +1954,7 @@ def _shape_sleeve_to_arm_contour(
 #  fools detect_garment_category (e.g. crewneck tee read as dress).
 # ═══════════════════════════════════════════════════════════════════
 CATEGORY_LOCK_CHOICES = [
-    "auto", "top", "tshirt", "hoodie", "jacket", "outer",
+    "auto", "top", "tshirt", "shirt", "hoodie", "jacket", "outer",
     "pants", "jeans", "shorts", "dress", "skirt",
     "belt", "bag", "scarf", "hat", "sunglasses", "shoes", "boots",
     "generic",
@@ -1966,7 +1973,7 @@ def _locked_garment_category(category_lock: str, cloth_mask: np.ndarray | None =
     lock = _normalize_category_lock(category_lock)
     if lock == "auto":
         return detect_garment_category(cloth_mask) if cloth_mask is not None else "top"
-    if lock in {"top", "tshirt", "hoodie", "jacket", "outer", "generic"}:
+    if lock in {"top", "tshirt", "shirt", "hoodie", "jacket", "outer", "generic"}:
         return "top"
     if lock in {"pants", "jeans", "shorts"}:
         return "pants"
@@ -1990,9 +1997,9 @@ def _locked_accessory_subtype(category_lock: str) -> str:
 
 
 def _locked_top_subtype(category_lock: str) -> str:
-    """UI lock → top subtype (hoodie/tshirt/jacket/outer) or "" for plain top."""
+    """UI lock → top subtype (hoodie/tshirt/shirt/jacket/outer) or "" for plain top."""
     lock = _normalize_category_lock(category_lock)
-    if lock in {"hoodie", "tshirt", "jacket", "outer"}:
+    if lock in {"hoodie", "tshirt", "shirt", "jacket", "outer"}:
         return lock
     return ""
 
@@ -2018,6 +2025,7 @@ def _category_prompt_from_lock(category_lock: str) -> str:
     return {
         "top": "a realistic upper-body top garment matching the reference",
         "tshirt": "a realistic t-shirt matching the reference",
+        "shirt": "a realistic long-sleeve button-up shirt matching the reference, pointed collar and visible front button placket",
         "hoodie": "a realistic hoodie matching the reference",
         "jacket": "a realistic jacket matching the reference",
         "outer": "realistic outerwear matching the reference",
@@ -4918,6 +4926,17 @@ def _build_shorts_shape_mask(
     )
 
 
+def _build_shorts_wear_mask(
+    shape: tuple[int, int],
+    parsing: dict | None,
+    full_pose: dict | None,
+    edit_mask: np.ndarray | None,
+) -> np.ndarray:
+    return _pp_build_shorts_wear_mask(
+        shape, parsing, full_pose, edit_mask, fit_like=_fit_like,
+    )
+
+
 def _build_pants_shape_mask(
     shape: tuple[int, int],
     warped_mask: np.ndarray,
@@ -4957,11 +4976,12 @@ def _apply_shorts_shape_guard(
     parsing: dict | None,
     full_pose: dict | None,
     reference_cloth_rgb: np.ndarray | None,
+    final_wear_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     return _pp_apply_shorts_shape_guard(
         output_rgb, person_rgb, init_tryon_rgb,
         warped_mask, gen_mask_soft, parsing, full_pose, reference_cloth_rgb,
-        fit_like=_fit_like, safe_uint8=_safe_uint8,
+        fit_like=_fit_like, safe_uint8=_safe_uint8, final_wear_mask=final_wear_mask,
     )
 
 
@@ -5109,11 +5129,14 @@ def _build_pants_diffusion_seed(
     reference_cloth_rgb: np.ndarray | None,
     pants_type: str = "regular",
     warped_mask: np.ndarray | None = None,
+    cleanup_mask: np.ndarray | None = None,
+    cleanup_fill_rgb: np.ndarray | None = None,
 ) -> np.ndarray:
     return _pp_build_pants_diffusion_seed(
         init_tryon, gen_mask_soft, reference_cloth_rgb,
         safe_uint8=_safe_uint8, build_cloth_mask=build_cloth_mask,
         pants_type=pants_type, warped_mask=warped_mask,
+        cleanup_mask=cleanup_mask, cleanup_fill_rgb=cleanup_fill_rgb,
     )
 
 
@@ -5153,6 +5176,8 @@ def _run_local_diffusion_refinement(
 
     h, w = init_tryon.shape[:2]
     binary_mask = (warped_mask > 20).astype(np.uint8) * 255
+    shorts_wear_mask_for_seed = None
+    shorts_seed_cleanup_mask = None
 
     if binary_mask.sum() < 500:
         return init_tryon, "", "Garment mask too small for diffusion", pipeline_info
@@ -5834,28 +5859,261 @@ def _run_local_diffusion_refinement(
             pipeline_info.append("PantsShapeUnion:v19.32")
 
     if garment_category == "pants" and pants_type == "shorts":
-        shorts_shape_mask = _build_shorts_shape_mask((h, w), binary_mask, parsing, full_pose)
-        if int(cv2.countNonZero(shorts_shape_mask)) > 255:
-            # v19.30: source-warped pants must drive the silhouette; the old
-            # parsing-derived shape was reshaping shorts back into the jeans
-            # outline (recolor effect). Union with a dilated warp footprint.
-            source_shape = cv2.dilate(
-                ((binary_mask > 20).astype(np.uint8)) * 255,
-                np.ones((9, 9), np.uint8), iterations=1,
+        shorts_seed_cleanup_mask = binary_mask.copy()
+        _shorts_prompt_low = (style_prompt or "").lower()
+        _is_denim_shorts_prompt = any(_kw in _shorts_prompt_low for _kw in (
+            "denim", "jean", "jeans", "blue wash", "button", "zip",
+            "zipper", "fly closure", "belt loop", "belt loops",
+            "high-waist", "high waist", "high-waisted", "frayed hem",
+        ))
+        # v22.18: prefer parsing.pants (the actual worn shorts on the model)
+        # as the dominant shape. SegFormer captures the real hip width, leg
+        # opening curve and hem line, while MediaPipe's hip/knee keypoints
+        # are often shifted inward and produce a too-narrow / wrong-form
+        # envelope. We fall back to the pose-driven mask only when parsing
+        # is unreliable.
+        _parsing_shorts = None
+        if parsing:
+            _ps = np.zeros((h, w), dtype=np.uint8)
+            for _k in ("pants", "skirt"):
+                _p = parsing.get(_k)
+                if _p is not None:
+                    _ps = cv2.bitwise_or(_ps, _p)
+            if int(cv2.countNonZero(_ps)) > 500:
+                _ps_bin = ((_ps > 20).astype(np.uint8)) * 255
+                _best_label = 0
+                _best_score = -1.0
+                try:
+                    _hip_y = None
+                    _ref_len = max(48.0, float(h) * 0.12)
+                    if full_pose is not None:
+                        _lh = full_pose.get("left_hip")
+                        _rh = full_pose.get("right_hip")
+                        _ls = full_pose.get("left_shoulder")
+                        _rs = full_pose.get("right_shoulder")
+                        if _lh is not None and _rh is not None:
+                            _hip_y = float((_lh[1] + _rh[1]) * 0.5)
+                            _hip_w = abs(float(_rh[0]) - float(_lh[0]))
+                            _sw = abs(float(_rs[0]) - float(_ls[0])) if _ls is not None and _rs is not None else _hip_w * 2.0
+                            _ref_len = max(48.0, _sw, _hip_w * 2.0)
+                    _num, _labels, _stats, _cent = cv2.connectedComponentsWithStats(_ps_bin, connectivity=8)
+                    for _i in range(1, _num):
+                        _x, _y, _bw, _bh, _area = _stats[_i]
+                        if _area < 500:
+                            continue
+                        _cy = float(_cent[_i][1])
+                        if _hip_y is not None:
+                            if _cy < _hip_y - _ref_len * 0.55 or _cy > _hip_y + _ref_len * 0.78:
+                                continue
+                            if _y > _hip_y + _ref_len * 0.55:
+                                continue
+                            _score = float(_area) - abs(_cy - _hip_y) * 20.0
+                        else:
+                            if _cy > h * 0.70:
+                                continue
+                            _score = float(_area)
+                        if _score > _best_score:
+                            _best_score = _score
+                            _best_label = _i
+                    if _best_label > 0:
+                        _parsing_shorts = ((_labels == _best_label).astype(np.uint8)) * 255
+                    else:
+                        _parsing_shorts = _ps_bin
+                except Exception:
+                    _parsing_shorts = _ps_bin
+                _parsing_shorts = cv2.morphologyEx(
+                    _parsing_shorts, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=1,
+                )
+
+        if _parsing_shorts is not None:
+            # Use the real worn-shorts silhouette. Light dilation gives SD a
+            # few pixels of fabric slack around the hip and hem.
+            _shorts_base = cv2.dilate(
+                _parsing_shorts, np.ones((7, 7), np.uint8), iterations=1,
             )
-            gen_mask = cv2.bitwise_or(source_shape, shorts_shape_mask)
-            # Subtract upper body once more so the unioned source can't bleed up
+            # v22.20: derive STRAIGHT waist line + hem line from parsing.pants
+            # so the warped reference (which carries hanging drawstrings and
+            # a jagged waistband from the studio image) cannot pull the mask
+            # into a wavy top edge or a dangling sash below the hem.
+            # v22.21: relaxed hem slack — percentile 98 + 4px was clipping
+            # the natural curved leg openings, producing notches/missing
+            # pieces at the inseam and outer leg. Keep waist tight (it is
+            # naturally horizontal) but give hem ~15px of fabric room.
+            _ys_ps, _xs_ps = np.where(_parsing_shorts > 20)
+            _waist_y = None
+            _hem_y = None
+            if len(_ys_ps) > 200:
+                _cx = float(np.median(_xs_ps))
+                _half = max(20.0, float(_xs_ps.max() - _xs_ps.min()) * 0.30)
+                _central = (_xs_ps > _cx - _half) & (_xs_ps < _cx + _half)
+                if int(_central.sum()) > 50:
+                    _waist_y = int(np.percentile(_ys_ps[_central], 5))
+                    _hem_y = int(np.percentile(_ys_ps, 99))
+            # Union with the warped reference footprint so SD has anchor
+            # pixels of the new garment color inside the mask.
+            _warp_src = ((binary_mask > 20).astype(np.uint8)) * 255
+            shorts_seed_cleanup_mask = _warp_src.copy()
+            if int(cv2.countNonZero(_warp_src)) > 200:
+                _warp_dil = cv2.dilate(_warp_src, np.ones((5, 5), np.uint8), iterations=1)
+                # v22.21: tighter halo for shorts (15 instead of 21) so
+                # drawstring tips of the warped reference cannot extend far
+                # outside the worn-shorts silhouette, but still wide enough
+                # for SD to draw natural leg openings/curves.
+                _warp_zone = cv2.dilate(
+                    _parsing_shorts, np.ones((15, 15), np.uint8), iterations=1,
+                )
+                _shorts_base = cv2.bitwise_or(
+                    _shorts_base, cv2.bitwise_and(_warp_dil, _warp_zone),
+                )
+            # Close small holes the parser left around the waistband.
+            _shorts_base = cv2.morphologyEx(
+                _shorts_base, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8), iterations=1,
+            )
+            # v22.20: enforce STRAIGHT horizontal waistband + hem cap so the
+            # final mask matches a real shorts silhouette instead of the
+            # jagged parsing edge / warp drawstring blob.
+            # v22.21: only tighten ABOVE the waist line — leave generous hem
+            # room (+15px) so SD can paint natural curved leg openings.
+            if _waist_y is not None and _hem_y is not None and _hem_y > _waist_y + 8:
+                _waist_overlap = 18 if _is_denim_shorts_prompt else 6
+                _waist_top_cut = max(0, _waist_y - _waist_overlap)
+                _shorts_base[:_waist_top_cut, :] = 0
+                _hem_bot_cut = min(h, _hem_y + 15)
+                _shorts_base[_hem_bot_cut:, :] = 0
+                # v22.21: fill central waist gaps. Parsing.pants for shorts
+                # often has a notch at the very top center where the model's
+                # belly button / waistband crease confuses the parser. Force
+                # a thin solid waistband bar from waist_y down ~6px.
+                _bar_half = max(_half, float(_xs_ps.max() - _xs_ps.min()) * (0.43 if _is_denim_shorts_prompt else 0.30))
+                _bar_l = max(0, int(_cx - _bar_half))
+                _bar_r = min(w, int(_cx + _bar_half))
+                _bar_top = max(0, _waist_y - (15 if _is_denim_shorts_prompt else 0))
+                _bar_b = min(h, _waist_y + (12 if _is_denim_shorts_prompt else 6))
+                _shorts_base[_bar_top:_bar_b, _bar_l:_bar_r] = 255
+            # v22.22: parsing shorts are one connected blob, so the bottom
+            # center can become a small tab that SD reads as a crotch stripe or
+            # fabric tail. Carve a modest V gap only in the lower center.
+            def _carve_shorts_center_gap(_mask: np.ndarray) -> np.ndarray:
+                _m = _mask.copy()
+                _ys, _xs = np.where(_m > 20)
+                if len(_xs) < 200:
+                    return _m
+                _x1, _x2 = int(_xs.min()), int(_xs.max())
+                _y1, _y2 = int(_ys.min()), int(_ys.max())
+                _width = max(1, _x2 - _x1)
+                _height = max(1, _y2 - _y1)
+                _cx = int(np.median(_xs))
+                # v22.21: only carve the bottom ~25% (hem leg opening). The
+                # old 54% start cut a tall V that produced a visible notch
+                # up into the crotch/inner thigh area of the rendered shorts.
+                _top = int(_y1 + _height * 0.78)
+                _bot = min(h - 1, _y2 + max(2, int(_height * 0.04)))
+                if _bot <= _top + 4:
+                    return _m
+                _top_half = max(2, int(_width * 0.015))
+                _bot_half = max(6, int(_width * 0.055))
+                _gap_poly = np.array([
+                    [_cx - _top_half, _top],
+                    [_cx + _top_half, _top],
+                    [_cx + _bot_half, _bot],
+                    [_cx - _bot_half, _bot],
+                ], dtype=np.int32)
+                cv2.fillPoly(_m, [_gap_poly], 0, lineType=cv2.LINE_AA)
+                return (_m > 20).astype(np.uint8) * 255
+            _shorts_base = _carve_shorts_center_gap(_shorts_base)
+            gen_mask = _shorts_base
+            # Upper-body protect (do NOT subtract "dress" — see v22.11 note).
             if parsing:
                 _ub2 = np.zeros_like(gen_mask)
-                for _k in ("upper_clothes", "dress", "left_arm", "right_arm", "face", "hair"):
+                _upper_clip_y = None
+                for _k in ("upper_clothes", "left_arm", "right_arm", "face", "hair"):
                     _p = parsing.get(_k)
                     if _p is not None:
+                        if _k == "upper_clothes" and _waist_y is not None:
+                            _p = _p.copy()
+                            _upper_clip_y = max(0, _waist_y - (18 if _is_denim_shorts_prompt else 6))
+                            _p[_upper_clip_y:, :] = 0
                         _ub2 = cv2.bitwise_or(_ub2, _p)
                 if int(cv2.countNonZero(_ub2)) > 0:
-                    _ub2 = cv2.dilate(_ub2, np.ones((11, 11), np.uint8), iterations=1)
+                    _ub2 = cv2.dilate(_ub2, np.ones((9, 9), np.uint8), iterations=1)
+                    if _upper_clip_y is not None and _is_denim_shorts_prompt:
+                        # Dilation of upper_clothes can creep back over the
+                        # high-waist denim band; trim it again after dilation.
+                        _ub2[_upper_clip_y:, :] = cv2.bitwise_and(
+                            _ub2[_upper_clip_y:, :],
+                            cv2.bitwise_not(cv2.dilate(
+                                parsing.get("upper_clothes", np.zeros_like(_ub2))[_upper_clip_y:, :],
+                                np.ones((3, 3), np.uint8),
+                                iterations=1,
+                            )),
+                        )
                     gen_mask = cv2.subtract(gen_mask, _ub2)
+            # Shoe protect using parsing + pose fallback (same logic as the
+            # long-pants branch). Hem of worn shorts is well above shoes, so
+            # this normally is a no-op but it guards against parser leak.
+            try:
+                _sp = np.zeros((h, w), dtype=np.uint8)
+                for _k in ("left_shoe", "right_shoe"):
+                    _p = parsing.get(_k) if parsing else None
+                    if _p is not None:
+                        _sp = cv2.bitwise_or(_sp, _p)
+                if int(cv2.countNonZero(_sp)) > 80:
+                    _sp = cv2.dilate(_sp, np.ones((9, 9), np.uint8), iterations=1)
+                    gen_mask = cv2.subtract(gen_mask, _sp)
+            except Exception:
+                pass
+            # Seed/anchor mask = the same parsing silhouette so reference
+            # color is sampled exactly inside the worn shorts.
+            shorts_wear_mask_for_seed = cv2.dilate(
+                _parsing_shorts, np.ones((5, 5), np.uint8), iterations=1,
+            )
+            if _waist_y is not None and _hem_y is not None and _hem_y > _waist_y + 8:
+                _seed_top = max(0, _waist_y - (16 if _is_denim_shorts_prompt else 4))
+                shorts_wear_mask_for_seed[:_seed_top, :] = 0
+                shorts_wear_mask_for_seed[min(h, _hem_y + 12):, :] = 0
+                _seed_bar_l = locals().get("_bar_l", max(0, int(_cx - _half)))
+                _seed_bar_r = locals().get("_bar_r", min(w, int(_cx + _half)))
+                _seed_bar_top = max(0, _waist_y - (14 if _is_denim_shorts_prompt else 0))
+                _seed_bar_b = min(h, _waist_y + (12 if _is_denim_shorts_prompt else 6))
+                shorts_wear_mask_for_seed[_seed_bar_top:_seed_bar_b, _seed_bar_l:_seed_bar_r] = 255
+            shorts_wear_mask_for_seed = _carve_shorts_center_gap(shorts_wear_mask_for_seed)
             _debug_save("09c_shorts_shape_mask", gen_mask, is_mask=True)
-            pipeline_info.append("ShortsSourceShapeUnion:v19.30")
+            _debug_save("09c0_shorts_parsing_base", _parsing_shorts, is_mask=True)
+            _debug_save("09c1_shorts_wear_mask", shorts_wear_mask_for_seed, is_mask=True)
+            pipeline_info.append(
+                "ShortsParsingDriven:v22.24_denim_waist"
+                if _is_denim_shorts_prompt else
+                "ShortsParsingDriven:v22.22"
+            )
+        else:
+            # Fallback: pose-driven envelope (legacy v22.12-v22.17 path).
+            shorts_shape_mask = _build_shorts_shape_mask((h, w), binary_mask, parsing, full_pose)
+            if int(cv2.countNonZero(shorts_shape_mask)) > 255:
+                gen_mask = shorts_shape_mask
+                if parsing:
+                    _ub2 = np.zeros_like(gen_mask)
+                    for _k in ("upper_clothes", "left_arm", "right_arm", "face", "hair"):
+                        _p = parsing.get(_k)
+                        if _p is not None:
+                            _ub2 = cv2.bitwise_or(_ub2, _p)
+                    if int(cv2.countNonZero(_ub2)) > 0:
+                        _ub2 = cv2.dilate(_ub2, np.ones((11, 11), np.uint8), iterations=1)
+                        gen_mask = cv2.subtract(gen_mask, _ub2)
+                shorts_wear_mask_for_seed = _build_shorts_wear_mask(
+                    (h, w), parsing, full_pose, gen_mask,
+                )
+                if int(cv2.countNonZero(shorts_wear_mask_for_seed)) > 200:
+                    gen_mask = cv2.bitwise_or(gen_mask, shorts_wear_mask_for_seed)
+                try:
+                    _shorts_band = _pp_build_shorts_edit_band((h, w), full_pose)
+                    if int(cv2.countNonZero(_shorts_band)) > 0:
+                        gen_mask = cv2.bitwise_and(gen_mask, _shorts_band)
+                        pipeline_info.append("ShortsBandReclip:v22.17")
+                except Exception as exc:
+                    pipeline_info.append(f"ShortsBandReclipSkip:{type(exc).__name__}")
+                _debug_save("09c_shorts_shape_mask", gen_mask, is_mask=True)
+                _debug_save("09c1_shorts_wear_mask", shorts_wear_mask_for_seed, is_mask=True)
+                pipeline_info.append("ShortsPoseFallback:v22.18")
 
     if garment_category == "top" and (top_subtype or "").lower() == "hoodie":
         # v22.10: HoodieStructureAnchor + HoodieSleeveTorsoPrior were carving
@@ -5873,10 +6131,67 @@ def _run_local_diffusion_refinement(
     # keep the wider feather for fabric drape.
     if garment_category == "pants" and pants_type != "shorts":
         blur_k = 3
+    elif garment_category == "pants" and pants_type == "shorts":
+        # v22.19: tight feather for shorts so the hip waistband and white
+        # trim do not bleed into a soft halo. Parsing-driven base already
+        # has a precise edge.
+        blur_k = 3
     elif garment_category == "top" and (top_subtype or "").lower() == "hoodie":
         blur_k = 3
     else:
         blur_k = max(7, (h // 50) | 1)  # ~10px at 512, always odd
+
+    # Jacket subtype mask cleanup: prevent the two recurring failure modes
+    # visible in current output — (a) fabric bleeding up onto the chin/jaw
+    # because the 21px dilation pushes the mask over the lower face, and (b)
+    # a vertical split at the bottom hem when the parsing left/right halves
+    # are not perfectly continuous. Cap the top of the mask at the face
+    # bottom + small margin, and horizontally close the lower hem band.
+    if garment_category == "top" and (top_subtype or "").lower() == "jacket":
+        try:
+            if parsing and parsing.get("face") is not None:
+                _face = parsing["face"]
+                if _face.shape[:2] != (h, w):
+                    _face = cv2.resize(_face, (w, h), interpolation=cv2.INTER_NEAREST)
+                _face_ys = np.where(_face > 20)[0]
+                if len(_face_ys):
+                    _chin_y = int(_face_ys.max())
+                    _chin_pad = max(4, int(h * 0.012))
+                    _top_cut = max(0, _chin_y - _chin_pad)
+                    _zero_band = np.zeros_like(gen_mask)
+                    _zero_band[:_top_cut, :] = 255
+                    # Erase mask above chin to keep jacket fabric off the jaw.
+                    gen_mask = cv2.bitwise_and(gen_mask, cv2.bitwise_not(_zero_band))
+                    pipeline_info.append("JacketChinCap:v1")
+            # Only seal hem if there's an ACTUAL vertical split — i.e. a column
+            # of zeros in the lower band that is bordered by mask on both sides.
+            # An unconditional MORPH_CLOSE with a wide horizontal kernel smears
+            # over real diffusion detail (zipper teeth, pocket seams).
+            _ys_jk = np.where(gen_mask > 20)[0]
+            if len(_ys_jk):
+                _jk_top = int(_ys_jk.min())
+                _jk_bot = int(_ys_jk.max())
+                _jk_h = max(1, _jk_bot - _jk_top)
+                _lo_y0 = int(_jk_top + _jk_h * 0.72)
+                _lo_y1 = _jk_bot + 1
+                _lower = gen_mask[_lo_y0:_lo_y1, :]
+                if _lower.size:
+                    _col_has = (_lower > 20).any(axis=0)
+                    _nz_cols = np.where(_col_has)[0]
+                    if len(_nz_cols) >= 4:
+                        _cl, _cr = int(_nz_cols.min()), int(_nz_cols.max())
+                        _interior = _col_has[_cl:_cr + 1]
+                        _gap_cols = int((~_interior).sum())
+                        if _gap_cols >= 3:
+                            _lower_sealed = cv2.morphologyEx(
+                                _lower, cv2.MORPH_CLOSE,
+                                np.ones((3, 11), np.uint8), iterations=1,
+                            )
+                            gen_mask[_lo_y0:_lo_y1, :] = _lower_sealed
+                            pipeline_info.append(f"JacketHemSeal:v2-gap{_gap_cols}")
+        except Exception as _e:
+            pipeline_info.append(f"JacketMaskCleanupSkip:{type(_e).__name__}")
+
     gen_mask_soft = cv2.GaussianBlur(gen_mask, (blur_k, blur_k), blur_k / 3.0)
     gen_mask_soft = np.clip(gen_mask_soft, 0, 255).astype(np.uint8)
 
@@ -6055,11 +6370,73 @@ def _run_local_diffusion_refinement(
         # v19.42: with textured seed (warped jeans inside warp core, flat fill
         # only in extension area), strength can be moderate so diffusion
         # refines edges/drape without washing away denim texture/seams.
+        # v22.16: after cleaning the CPU-warp T layer from the seed, shorts can
+        # use enough denoise for SD to round/reshape the legs instead of just
+        # preserving the deterministic mask silhouette.
+        # v22.16: after cleaning the CPU-warp T layer from the seed, shorts can
+        # use enough denoise for SD to round/reshape the legs instead of just
+        # preserving the deterministic mask silhouette.
+        # v22.13: lift shorts strength so SD redraws the warped drawstring blob
+        # instead of preserving it; mirrors how the shirt path uses a clean
+        # POSITIVE template + higher denoise to redraw clothing geometry.
         _diff_strength = 0.78 if pants_type == "shorts" else 0.68
-        _diff_guidance = 4.4 if pants_type == "shorts" else 4.8
+        _diff_guidance = 5.2 if pants_type == "shorts" else 4.8
         if pants_type == "shorts":
-            _pants_noun = "shorts"
-            _pants_shape = "shorts ending above the knee, two short leg openings"
+            try:
+                from src.prompts.category_prompts import (
+                    PANTS_SHORTS_CONSTRAINT,
+                    PANTS_SHORTS_DENIM_CONSTRAINT,
+                    PANTS_SHORTS_POSITIVE,
+                )
+                _incoming_sp = (style_prompt or "").strip()
+                _incoming_low = _incoming_sp.lower()
+                _is_denim_shorts = any(_kw in _incoming_low for _kw in (
+                    "denim", "jean", "jeans", "blue wash", "button", "zip",
+                    "zipper", "fly closure", "belt loop", "belt loops",
+                    "high-waist", "high waist", "high-waisted", "frayed hem",
+                ))
+                # v22.19: don't override the user/Gemini prompt when it
+                # contains specific garment descriptors (colour, trim,
+                # stripe, logo, pattern). Only fall back to PANTS_SHORTS_POSITIVE
+                # when the prompt is truly empty / boilerplate.
+                _has_detail = any(_kw in _incoming_low for _kw in (
+                    "trim", "stripe", "stripes", "piping", "logo", "print",
+                    "pattern", "band", "ribbon", "contrast", "two-tone",
+                    "white", "red", "blue", "green", "yellow", "pink",
+                    "purple", "orange", "grey", "gray", "beige", "navy",
+                    "tan", "brown", "khaki", "olive",
+                ))
+                _is_generic_sp = (
+                    not _incoming_low
+                    or "realistic virtual try-on" in _incoming_low
+                    or "matching the reference garment" == _incoming_low
+                    or (
+                        not _has_detail and (
+                            "athletic shorts" in _incoming_low
+                            or "a photo of a person wearing" in _incoming_low
+                            or "a person wearing" in _incoming_low
+                        )
+                    )
+                )
+                if _is_generic_sp:
+                    style_prompt = PANTS_SHORTS_POSITIVE
+                    pipeline_info.append("ShortsPromptCfg:v22.22:override")
+                else:
+                    # Keep user/Gemini prompt verbatim + append our shorts
+                    # constraint so trim/colour descriptors survive.
+                    _shorts_constraint = (
+                        PANTS_SHORTS_DENIM_CONSTRAINT
+                        if _is_denim_shorts else
+                        PANTS_SHORTS_CONSTRAINT
+                    )
+                    style_prompt = f"{_incoming_sp}, {_shorts_constraint}".strip(", ").strip()
+                    pipeline_info.append(
+                        "ShortsPromptCfg:v22.23:denim"
+                        if _is_denim_shorts else
+                        "ShortsPromptCfg:v22.22:keep"
+                    )
+            except Exception:
+                pass
         elif pants_type == "cropped":
             _pants_noun = "cropped pants"
             _pants_shape = "cropped pants ending mid-calf, two straight leg openings"
@@ -6067,21 +6444,56 @@ def _run_local_diffusion_refinement(
             _pants_noun = "long pants"
             _pants_shape = (
                 "full-length long pants covering the entire legs down to the ankles, "
-                "two long straight leg openings, no skin visible between waist and ankle"
+                "two long straight leg openings, hem reaches the tops of the shoes, "
+                "no old cuffs visible below the hem, any exposed ankle skin keeps natural skin tone"
             )
-        _pants_tail = (
-            f"replace the old lower garment with the reference {_pants_noun}, "
-            f"{_pants_shape}, follow the reference fabric color and texture exactly, "
-            "natural waistband at the hips, soft fabric folds, "
-            "cover the previous bottom completely, "
-            "preserve original shirt, preserve torso and arms, "
-            "do not redraw upper body, natural shadows at waist and thighs"
-        )
-        _incoming = (style_prompt or "").strip()
-        style_prompt = (
-            f"{_incoming}, {_pants_tail}".strip(", ").strip()
-            if _incoming else _pants_tail
-        )
+        if pants_type != "shorts":
+            _incoming = (style_prompt or "").strip()
+            _incoming_low = _incoming.lower()
+            if pants_type != "cropped" and re.search(r"\bankle[- ]length\b|\bankle\s+length\b", _incoming_low):
+                _incoming = re.sub(
+                    r"\bankle[- ]length\b|\bankle\s+length\b",
+                    "full-length",
+                    _incoming,
+                    flags=re.IGNORECASE,
+                )
+                _incoming_low = _incoming.lower()
+                pipeline_info.append("PantsPromptLengthFix:v19.65:ankle_to_full")
+            if re.search(r"\bshorts?\b", _incoming_low):
+                _is_denim_long = any(_kw in _incoming_low for _kw in (
+                    "denim", "jean", "jeans", "blue wash", "button", "zip",
+                    "zipper", "fly closure", "belt loop", "belt loops",
+                ))
+                if pants_type == "cropped":
+                    _incoming = (
+                        "A model wearing cropped pants matching the reference garment, "
+                        "two separate pant legs, finished hems, old lower garment fully covered"
+                    )
+                elif _is_denim_long:
+                    _incoming = (
+                        "A model wearing full-length light blue wash straight-leg jeans matching the reference garment, "
+                        "high-waisted denim pants with button and zip closure, classic five-pocket styling, "
+                        "continuous denim fabric from waistband to shoe tops, finished hems covering the old cuffs completely"
+                    )
+                else:
+                    _incoming = (
+                        "A model wearing full-length pants matching the reference garment, "
+                        "two long straight pant legs, finished hems reaching the tops of the shoes, "
+                        "old lower garment fully covered"
+                    )
+                pipeline_info.append("PantsPromptConflictFix:v19.64:shorts_to_long")
+            _pants_tail = (
+                f"replace the old lower garment with the reference {_pants_noun}, "
+                f"{_pants_shape}, follow the reference fabric color and texture exactly, "
+                "natural waistband at the hips, soft fabric folds, "
+                "cover the previous bottom completely, no original pants visible under the hem, "
+                "preserve original shirt, preserve torso and arms, "
+                "do not redraw upper body, natural shadows at waist and thighs"
+            )
+            style_prompt = (
+                f"{_incoming}, {_pants_tail}".strip(", ").strip()
+                if _incoming else _pants_tail
+            )
         pipeline_info.append(f"PantsPromptCfg:v19.29:{pants_type}")
 
     try:
@@ -6116,7 +6528,16 @@ def _run_local_diffusion_refinement(
             # wider dilation for waistband+pocket detail) and lower band
             # (calf/ankle, narrower so seed doesn't bleed onto shoes).
             texture_anchor_mask = binary_mask
-            if pants_type != "shorts":
+            if pants_type == "shorts":
+                if shorts_wear_mask_for_seed is None or int(cv2.countNonZero(shorts_wear_mask_for_seed)) < 200:
+                    shorts_wear_mask_for_seed = _build_shorts_wear_mask(
+                        (h, w), parsing, full_pose, gen_mask,
+                    )
+                if int(cv2.countNonZero(shorts_wear_mask_for_seed)) > 200:
+                    texture_anchor_mask = shorts_wear_mask_for_seed
+                    _debug_save("09b1_shorts_seed_wear_mask", texture_anchor_mask, is_mask=True)
+                    pipeline_info.append("ShortsReferenceSeedMask:v22.22")
+            else:
                 ys, xs = np.where(binary_mask > 20)
                 if len(ys) > 100:
                     y1, y2 = int(ys.min()), int(ys.max())
@@ -6160,9 +6581,15 @@ def _run_local_diffusion_refinement(
                 reference_cloth_rgb,
                 pants_type=pants_type,
                 warped_mask=texture_anchor_mask,
+                cleanup_mask=shorts_seed_cleanup_mask if pants_type == "shorts" else None,
+                cleanup_fill_rgb=person_rgb if pants_type == "shorts" else None,
             )
             _debug_save("09b_pants_diffusion_seed", diffusion_init)
-            pipeline_info.append("PantsReferenceSeed:v19.45_band_anchor")
+            pipeline_info.append(
+                "ShortsReferenceSeed:v22.22_clean_person_trim"
+                if pants_type == "shorts" else
+                "PantsReferenceSeed:v19.66_clean_anchor"
+            )
         elif garment_category == "dress":
             diffusion_init = _build_dress_diffusion_seed(init_tryon, gen_mask_soft, binary_mask)
             _debug_save("09b_dress_diffusion_seed", diffusion_init)
@@ -6191,6 +6618,44 @@ def _run_local_diffusion_refinement(
             base_negative=GenConfig().negative_prompt or "",
             subtype=top_subtype if garment_category == "top" else "",
         )
+        if garment_category == "pants" and pants_type == "shorts":
+            _style_low_for_neg = (style_prompt or "").lower()
+            if any(_kw in _style_low_for_neg for _kw in ("denim", "jean", "jeans", "blue wash")):
+                _negative_prompt = _negative_prompt.replace("blue denim shorts visible, ", "")
+                _negative_prompt = _negative_prompt.replace("blue denim shorts visible", "")
+                _negative_prompt = _negative_prompt.replace("old jeans visible, ", "")
+                _negative_prompt = _negative_prompt.replace("old jeans visible", "")
+                _negative_prompt = _negative_prompt.replace("covering stomach, ", "")
+                _negative_prompt = _negative_prompt.replace("covering stomach", "")
+                pipeline_info.append("ShortsDenimNegativeFix:v22.24")
+            _shorts_extra_negative = (
+                "T-shape silhouette, wide hip flare, flared shorts, skirt shape, "
+                "fabric tail below crotch, shorts wider than hips, shorts width different from hip width, "
+                "missing left front pocket, missing right front pocket, one pocket only, "
+                "no pocket opening, pocket removed, blank front hip panel, "
+                "shirt tail over shorts, scarf tail over shorts, white strip over shorts, "
+                "upper garment hanging over shorts"
+                if any(_kw in _style_low_for_neg for _kw in ("denim", "jean", "jeans", "blue wash")) else
+                "horizontal fabric band across the waist, T-shape silhouette, "
+                "wide hip flare, flared shorts, skirt shape, pleated waistband, "
+                "fabric bar extending sideways past the hips, "
+                "old waistband visible, second waistband, "
+                "shorts wider than hips, shorts width different from hip width"
+            )
+            _negative_prompt = f"{_negative_prompt}, {_shorts_extra_negative}".strip(", ").strip()
+        elif garment_category == "pants":
+            _pants_extra_negative = (
+                "shorts, denim shorts, short pants, cropped above ankle, capri pants, "
+                "hem stops above ankle, ankle cuff exposed, old cuffs visible, "
+                "original jeans cuff visible, old pants visible below hem, "
+                "previous pants showing under new pants, black belt, dark belt, "
+                "black waistband block, belt over jeans, blue ankle skin, "
+                "denim-colored ankles, blue foot skin"
+                if pants_type != "cropped" else
+                "shorts, denim shorts, old cuffs visible, original pants visible below hem"
+            )
+            _negative_prompt = f"{_negative_prompt}, {_pants_extra_negative}".strip(", ").strip()
+            pipeline_info.append("PantsNegativeHemLock:v19.64")
         if gemini_negative_extra:
             _negative_prompt = f"{_negative_prompt}, {gemini_negative_extra}".strip(", ").strip()
 
@@ -6221,6 +6686,73 @@ def _run_local_diffusion_refinement(
             except Exception:
                 pass
 
+        # Jacket subtype: enforce a bomber-jacket prompt so SD draws the ribbed
+        # hem, two side pockets and full-length zipper instead of collapsing
+        # the jacket into a cropped tee/sweater silhouette (the recurring
+        # "short hem, no pockets" failure mode).
+        if garment_category == "top" and (top_subtype or "").lower() == "jacket":
+            try:
+                from src.prompts.category_prompts import TOP_JACKET_CONSTRAINT, TOP_JACKET_POSITIVE
+                _incoming_jk = (style_prompt or "").strip().lower()
+                _is_generic_jk = (
+                    not _incoming_jk
+                    or "realistic virtual try-on" in _incoming_jk
+                    or "matching the reference garment" == _incoming_jk
+                )
+                if _is_generic_jk:
+                    style_prompt = TOP_JACKET_POSITIVE
+                else:
+                    style_prompt = f"{style_prompt}, {TOP_JACKET_CONSTRAINT}".strip(", ").strip()
+                pipeline_info.append("JacketPromptCfg:v1")
+            except Exception:
+                pass
+
+        # Shirt subtype: force a button-up shirt prompt so SD keeps the point
+        # collar + center button placket + buttoned cuffs and doesn't collapse
+        # the result into a bomber jacket (stand collar, zipper, ribbed hem),
+        # which is what happens with the generic top prompt when the warped
+        # mask resembles a jacket silhouette.
+        if garment_category == "top" and (top_subtype or "").lower() == "shirt":
+            try:
+                from src.prompts.category_prompts import TOP_SHIRT_CONSTRAINT, TOP_SHIRT_POSITIVE
+                _incoming_sh = (style_prompt or "").strip().lower()
+                _is_generic_sh = (
+                    not _incoming_sh
+                    or "realistic virtual try-on" in _incoming_sh
+                    or "matching the reference garment" == _incoming_sh
+                    or "bomber" in _incoming_sh
+                    or "jacket" in _incoming_sh
+                )
+                if _is_generic_sh:
+                    style_prompt = TOP_SHIRT_POSITIVE
+                else:
+                    style_prompt = f"{style_prompt}, {TOP_SHIRT_CONSTRAINT}".strip(", ").strip()
+                pipeline_info.append("ShirtPromptCfg:v1")
+            except Exception:
+                pass
+
+        # T-shirt subtype: append a strong constraint that locks the chest
+        # graphic / typography so SD does not regenerate it into garbled text
+        # or a new logo. Keeps the user-supplied prompt verbatim (Gemini usually
+        # already describes the print accurately) and just appends the lock tail.
+        if garment_category == "top" and (top_subtype or "").lower() == "tshirt":
+            try:
+                from src.prompts.category_prompts import TOP_TSHIRT_CONSTRAINT, TOP_TSHIRT_POSITIVE
+                _incoming_ts = (style_prompt or "").strip()
+                _incoming_ts_low = _incoming_ts.lower()
+                _is_generic_ts = (
+                    not _incoming_ts
+                    or "realistic virtual try-on" in _incoming_ts_low
+                    or "matching the reference garment" == _incoming_ts_low
+                )
+                if _is_generic_ts:
+                    style_prompt = TOP_TSHIRT_POSITIVE
+                else:
+                    style_prompt = f"{_incoming_ts}, {TOP_TSHIRT_CONSTRAINT}".strip(", ").strip()
+                pipeline_info.append("TshirtPromptCfg:v1")
+            except Exception:
+                pass
+
         def _generate_with_infer(infer_size: int) -> np.ndarray:
             return generate_tryon_image(
                 init_tryon_rgb=diffusion_init,
@@ -6238,13 +6770,20 @@ def _run_local_diffusion_refinement(
                     pattern_source_rgb if garment_category == "dress" else
                     reference_cloth_rgb if garment_category == "pants" else
                     reference_cloth_rgb if (garment_category == "top" and (top_subtype or "").lower() == "hoodie") else
+                    reference_cloth_rgb if (garment_category == "top" and (top_subtype or "").lower() == "jacket") else
+                    reference_cloth_rgb if (garment_category == "top" and (top_subtype or "").lower() == "shirt") else
+                    reference_cloth_rgb if (garment_category == "top" and (top_subtype or "").lower() == "tshirt") else
                     None
                 ),
                 ip_adapter_scale=float(os.getenv(
                     "VTON_IP_ADAPTER_SCALE",
-                    "0.65" if garment_category == "pants"
+                    "0.70" if (garment_category == "pants" and pants_type == "shorts")
+                    else ("0.65" if garment_category == "pants"
                     else ("0.36" if (garment_category == "top" and (top_subtype or "").lower() == "hoodie")
-                          else "0.46"),
+                          else ("0.48" if (garment_category == "top" and (top_subtype or "").lower() == "jacket")
+                                else ("0.52" if (garment_category == "top" and (top_subtype or "").lower() == "shirt")
+                                      else ("0.62" if (garment_category == "top" and (top_subtype or "").lower() == "tshirt")
+                                            else "0.46"))))),
                 )),
                 negative_prompt=_negative_prompt,
                 ),
@@ -6263,6 +6802,23 @@ def _run_local_diffusion_refinement(
         generated = _sanitize_rgb_output(generated)
         generated = _fit_like(generated, init_tryon, is_mask=False)
         binary_mask = _fit_like(binary_mask, generated, is_mask=True)
+        try:
+            _paint_mask = (gen_mask_soft > 20)
+            if int(_paint_mask.sum()) > 50:
+                _delta = np.mean(
+                    np.abs(
+                        generated.astype(np.int16)[_paint_mask]
+                        - diffusion_init.astype(np.int16)[_paint_mask]
+                    ),
+                    axis=1,
+                )
+                _changed_px = int((_delta > 8.0).sum())
+                _changed_ratio = _changed_px / float(max(1, int(_paint_mask.sum())))
+                pipeline_info.append(
+                    f"DiffPaintDelta:v1:mad{float(_delta.mean()):.1f}:chg{_changed_ratio:.2f}"
+                )
+        except Exception:
+            pass
         # Dress legacy fallback: use diffusion as the base only when it still
         # matches the intended dress geometry. If it loses sleeves, shortens the
         # hem, paints into face/hair, or drifts too wide at the waist, keep the
@@ -6415,6 +6971,99 @@ def _run_local_diffusion_refinement(
         # For all other categories, assign diffusion output here.
         if garment_category != "dress":
             output = generated
+
+        # Jacket: restore inner-shirt (e.g. white T at the open collar) which
+        # gets repainted in the jacket color because parsing labels both layers
+        # as "upper_clothes". Detect inner shirt as pixels inside upper_clothes
+        # whose ORIGINAL color is far from the jacket reference dominant color,
+        # restricted to the upper neckline strip where an inner layer can show.
+        if garment_category == "top" and (top_subtype or "").lower() == "jacket":
+            try:
+                if (
+                    parsing
+                    and parsing.get("upper_clothes") is not None
+                    and reference_cloth_rgb is not None
+                ):
+                    _h, _w = output.shape[:2]
+                    _upper = parsing["upper_clothes"]
+                    if _upper.shape[:2] != (_h, _w):
+                        _upper = cv2.resize(_upper, (_w, _h), interpolation=cv2.INTER_NEAREST)
+                    _upper_b = (_upper > 20)
+                    _ref = reference_cloth_rgb
+                    _ref_i = _ref.astype(np.int16)
+                    _ref_valid = ~((_ref_i[..., 0] > 232) & (_ref_i[..., 1] > 232) & (_ref_i[..., 2] > 232))
+                    if int(_ref_valid.sum()) < 200:
+                        _ref_valid = np.ones(_ref.shape[:2], dtype=bool)
+                    _jacket_mean = _ref[_ref_valid].astype(np.float32).mean(axis=0)
+                    _orig_f = person_rgb.astype(np.float32)
+                    _diff = np.linalg.norm(_orig_f - _jacket_mean[None, None, :], axis=2)
+                    # Distinct from jacket color. Dark old jackets are also far
+                    # from a camel reference, so this alone is not enough.
+                    _far = _diff > 55.0
+                    # Restrict to upper neckline band: top 36% of upper_clothes
+                    _ys_u = np.where(_upper_b)[0]
+                    _band = np.zeros((_h, _w), dtype=bool)
+                    if len(_ys_u):
+                        _y_top = int(_ys_u.min())
+                        _y_bot = int(_ys_u.max())
+                        _y_cut = int(_y_top + (_y_bot - _y_top) * 0.36)
+                        _band[_y_top:_y_cut, :] = True
+                    _center = np.zeros((_h, _w), dtype=bool)
+                    try:
+                        _ls = full_pose.get("left_shoulder") if full_pose else None
+                        _rs = full_pose.get("right_shoulder") if full_pose else None
+                        _lh = full_pose.get("left_hip") if full_pose else None
+                        _rh = full_pose.get("right_hip") if full_pose else None
+                        if _ls is not None and _rs is not None:
+                            _cx = float((_ls[0] + _rs[0]) * 0.5)
+                            _sw = max(32.0, abs(float(_rs[0]) - float(_ls[0])))
+                        elif _lh is not None and _rh is not None:
+                            _cx = float((_lh[0] + _rh[0]) * 0.5)
+                            _sw = max(32.0, abs(float(_rh[0]) - float(_lh[0])) * 1.35)
+                        else:
+                            _ux = np.where(_upper_b)[1]
+                            _cx = float(np.median(_ux)) if len(_ux) else _w * 0.5
+                            _sw = max(32.0, float(_ux.max() - _ux.min()) * 0.45) if len(_ux) else _w * 0.22
+                    except Exception:
+                        _cx, _sw = _w * 0.5, _w * 0.22
+                    _xx = np.arange(_w, dtype=np.float32)[None, :]
+                    _center = np.abs(_xx - _cx) <= (_sw * 0.24)
+                    # Exclude pixels close to skin tone (avoid restoring face/neck back
+                    # into the jacket area — face/neck are handled elsewhere)
+                    _r, _g, _b = _orig_f[..., 0], _orig_f[..., 1], _orig_f[..., 2]
+                    _lum = _orig_f.mean(axis=2)
+                    _chroma = _orig_f.max(axis=2) - _orig_f.min(axis=2)
+                    _is_skin = (_r > _b + 6.0) & (_r > _g - 4.0) & (_lum > 70.0) & (_lum < 235.0) & (_chroma < 80.0)
+                    # Shirt-like pixels: bright / neutral fabric. This keeps a
+                    # white tee/shirt but rejects the old black leather jacket.
+                    _shirt_like = (_lum > 125.0) & (_chroma < 86.0)
+                    _inner = _upper_b & _band & _center & _far & _shirt_like & (~_is_skin)
+                    _inner_u8 = _inner.astype(np.uint8) * 255
+                    # Keep only the largest connected component to avoid noise
+                    if int(_inner_u8.sum()) > 255 * 40:
+                        _num, _lbl, _stats, _ = cv2.connectedComponentsWithStats(_inner_u8, connectivity=8)
+                        if _num > 1:
+                            _areas = _stats[1:, cv2.CC_STAT_AREA]
+                            _keep = np.zeros_like(_inner_u8)
+                            for _i, _a in enumerate(_areas, start=1):
+                                if _a >= 80:
+                                    _keep[_lbl == _i] = 255
+                            _inner_u8 = _keep
+                        # Erode slightly to stay inside the inner-shirt region, then soft blur
+                        _inner_u8 = cv2.erode(_inner_u8, np.ones((3, 3), np.uint8), iterations=1)
+                        if int(_inner_u8.sum()) > 255 * 30:
+                            _alpha_in = cv2.GaussianBlur(_inner_u8, (0, 0), 1.6).astype(np.float32) / 255.0
+                            _alpha_in = np.clip(_alpha_in, 0.0, 1.0)[..., None]
+                            output = _safe_uint8(
+                                output.astype(np.float32) * (1.0 - _alpha_in)
+                                + person_rgb.astype(np.float32) * _alpha_in
+                            )
+                            _debug_save("10l_jacket_inner_shirt_mask", _inner_u8)
+                            _debug_save("10m_jacket_inner_shirt_restore", output)
+                            pipeline_info.append("JacketInnerShirtRestore:v2")
+            except Exception as _e:
+                pipeline_info.append(f"JacketInnerShirtRestoreSkip:{type(_e).__name__}")
+
         if garment_category == "top" and (top_subtype or "").lower() == "hoodie":
             output, hoodie_spill_mask = _remove_hoodie_edge_spill(
                 output,
@@ -6457,16 +7106,65 @@ def _run_local_diffusion_refinement(
             output, shorts_guard_mask = _apply_shorts_shape_guard(
                 output_rgb=output,
                 person_rgb=person_rgb,
-                init_tryon_rgb=init_tryon_clean,
+                init_tryon_rgb=diffusion_init,
                 warped_mask=binary_mask,
                 gen_mask_soft=gen_mask_soft,
                 parsing=parsing,
                 full_pose=full_pose,
                 reference_cloth_rgb=reference_cloth_rgb,
+                final_wear_mask=shorts_wear_mask_for_seed,
             )
             _debug_save("10f_shorts_shape_guard_mask", shorts_guard_mask, is_mask=True)
             _debug_save("10g_shorts_shape_guard", output)
-            pipeline_info.append("ShortsShapeGuard:v19.29")
+            pipeline_info.append("ShortsShapeGuard:v22.22")
+            _shorts_post_low = (style_prompt or "").lower()
+            _shorts_is_denim_post = any(_kw in _shorts_post_low for _kw in (
+                "denim", "jean", "jeans", "blue wash", "button", "zip",
+                "zipper", "fly closure", "belt loop", "belt loops",
+            ))
+            if _shorts_is_denim_post:
+                output = _pp_recover_pants_texture_detail(
+                    output,
+                    init_tryon_clean,
+                    shorts_guard_mask,
+                    safe_uint8=_safe_uint8,
+                    detail_strength=0.40,
+                    chroma_strength=0.12,
+                    sharpen_strength=0.18,
+                )
+                _debug_save("10h0_shorts_denim_texture_recover", output)
+                pipeline_info.append("ShortsDenimTextureRecover:v22.25")
+            output, _shorts_outer_spill = _pp_cleanup_shorts_external_spill(
+                output, person_rgb, shorts_guard_mask, safe_uint8=_safe_uint8,
+            )
+            if int(cv2.countNonZero(_shorts_outer_spill)) > 20:
+                _debug_save("10h_shorts_outer_spill_mask", _shorts_outer_spill, is_mask=True)
+                _debug_save("10i_shorts_outer_spill_clean", output)
+                pipeline_info.append("ShortsOuterSpillClean:v22.22")
+            if _shorts_is_denim_post:
+                output, _shorts_old_hem_bleed = _pp_cleanup_shorts_old_hem_bleed(
+                    output, shorts_guard_mask, safe_uint8=_safe_uint8,
+                )
+                if int(cv2.countNonZero(_shorts_old_hem_bleed)) > 8:
+                    _debug_save("10j_shorts_old_hem_bleed_mask", _shorts_old_hem_bleed, is_mask=True)
+                    _debug_save("10k_shorts_old_hem_bleed_clean", output)
+                    pipeline_info.append("ShortsOldHemBleedClean:v22.26_crotch_gap")
+                output, _shorts_upper_spill = _pp_cleanup_shorts_upper_cloth_spill(
+                    output, shorts_guard_mask, safe_uint8=_safe_uint8,
+                )
+                if int(cv2.countNonZero(_shorts_upper_spill)) > 12:
+                    _debug_save("10l_shorts_upper_cloth_spill_mask", _shorts_upper_spill, is_mask=True)
+                    _debug_save("10m_shorts_upper_cloth_spill_clean", output)
+                    pipeline_info.append("ShortsUpperClothSpillClean:v22.27")
+                pipeline_info.append("ShortsCenterTrimSkipDenim:v22.24")
+            else:
+                output, _shorts_center_artifact = _pp_cleanup_shorts_center_trim_artifact(
+                    output, shorts_guard_mask, safe_uint8=_safe_uint8,
+                )
+                if int(cv2.countNonZero(_shorts_center_artifact)) > 8:
+                    _debug_save("10j_shorts_center_trim_mask", _shorts_center_artifact, is_mask=True)
+                    _debug_save("10k_shorts_center_trim_clean", output)
+                    pipeline_info.append("ShortsCenterTrimClean:v22.22")
         elif garment_category == "pants":
             if pants_type == "shorts":
                 output, pants_guard_mask = _apply_pants_shape_guard(
@@ -6624,14 +7322,69 @@ def _run_local_diffusion_refinement(
                         # transfer + subtle sharpen). Leaves drape from
                         # diffusion intact, just sharpens texture.
                         try:
+                            _texture_recover_mask = allowed
+                            try:
+                                _ref_tex = cv2.dilate(
+                                    ((binary_mask > 20).astype(np.uint8)) * 255,
+                                    np.ones((13, 13), np.uint8),
+                                    iterations=1,
+                                )
+                                _texture_recover_mask = cv2.bitwise_and(allowed, _ref_tex)
+                                if int(cv2.countNonZero(_texture_recover_mask)) < 300:
+                                    _texture_recover_mask = allowed
+                                else:
+                                    _debug_save(
+                                        "10h_pants_texture_recover_mask",
+                                        _texture_recover_mask,
+                                        is_mask=True,
+                                    )
+                            except Exception:
+                                _texture_recover_mask = allowed
+                            _recover_detail_strength = 0.72
+                            _recover_chroma_strength = 0.32
+                            _recover_sharpen_strength = 0.48
+                            if pants_type != "shorts":
+                                try:
+                                    _ys_tr, _xs_tr = np.where(_texture_recover_mask > 20)
+                                    if len(_ys_tr) > 200:
+                                        _x1_tr, _x2_tr = int(_xs_tr.min()), int(_xs_tr.max())
+                                        _y1_tr, _y2_tr = int(_ys_tr.min()), int(_ys_tr.max())
+                                        _w_tr = max(1, _x2_tr - _x1_tr)
+                                        _h_tr = max(1, _y2_tr - _y1_tr)
+                                        _cx_tr = int(np.median(_xs_tr))
+                                        _yy_tr, _xx_tr = np.indices((h, w))
+                                        _unsafe_tex = (
+                                            ((_yy_tr >= _y1_tr) & (_yy_tr <= int(_y1_tr + _h_tr * 0.16)))
+                                            | (
+                                                (_yy_tr >= int(_y1_tr + _h_tr * 0.32))
+                                                & (_yy_tr <= int(_y1_tr + _h_tr * 0.56))
+                                                & (np.abs(_xx_tr - _cx_tr) <= max(8, int(_w_tr * 0.07)))
+                                            )
+                                            | (_yy_tr >= int(_y1_tr + _h_tr * 0.86))
+                                        )
+                                        _texture_recover_mask = cv2.subtract(
+                                            _texture_recover_mask,
+                                            (_unsafe_tex.astype(np.uint8)) * 255,
+                                        )
+                                        _debug_save(
+                                            "10h1_pants_texture_recover_safe_mask",
+                                            _texture_recover_mask,
+                                            is_mask=True,
+                                        )
+                                        pipeline_info.append("PantsTextureRecoverySafeZones:v19.66")
+                                except Exception as exc:
+                                    pipeline_info.append(f"PantsTextureRecoverySafeZonesSkip:{type(exc).__name__}")
+                                _recover_detail_strength = 0.38
+                                _recover_chroma_strength = 0.14
+                                _recover_sharpen_strength = 0.20
                             output = _pp_recover_pants_texture_detail(
-                                output, init_tryon_clean, allowed,
+                                output, init_tryon_clean, _texture_recover_mask,
                                 safe_uint8=_safe_uint8,
-                                detail_strength=0.72,
-                                chroma_strength=0.32,
-                                sharpen_strength=0.48,
+                                detail_strength=_recover_detail_strength,
+                                chroma_strength=_recover_chroma_strength,
+                                sharpen_strength=_recover_sharpen_strength,
                             )
-                            pipeline_info.append("PantsTextureRecovery:v19.63")
+                            pipeline_info.append("PantsTextureRecovery:v19.66_refmask_safe")
                         except Exception as exc:
                             pipeline_info.append(f"PantsTextureRecoverySkip:{type(exc).__name__}")
                         # v19.59 (restored from v19.61): hard composite cuối —
@@ -6687,6 +7440,15 @@ def _run_local_diffusion_refinement(
                                     _keep_below = cv2.bitwise_or(_keep_below, _capsule_pad)
                                 except Exception:
                                     pass
+                                try:
+                                    _full_pants_keep = locals().get("allowed_full", allowed)
+                                    _full_pants_keep = cv2.dilate(
+                                        _full_pants_keep, np.ones((5, 5), np.uint8), iterations=1,
+                                    )
+                                    _keep_below = cv2.bitwise_or(_keep_below, _full_pants_keep)
+                                    pipeline_info.append("PantsFinalHardCutHemKeep:v19.64")
+                                except Exception as exc:
+                                    pipeline_info.append(f"PantsFinalHardCutHemKeepSkip:{type(exc).__name__}")
 
                                 _zone_a = np.zeros((h, w), dtype=np.uint8)
                                 _zone_a[_hip_top:_below_hip_y, :] = 255
@@ -6706,6 +7468,7 @@ def _run_local_diffusion_refinement(
                                     ),
                                     0.0, 1.0,
                                 )
+                                _debug_save("10i_pants_final_keep_region", keep_region, is_mask=True)
                                 replace_alpha = (
                                     (lower_zone.astype(np.float32) / 255.0)
                                     * (1.0 - keep_soft)
@@ -6717,6 +7480,46 @@ def _run_local_diffusion_refinement(
                                 pipeline_info.append("PantsFinalHardCut:v19.59")
                         except Exception as exc:
                             pipeline_info.append(f"PantsFinalHardCutSkip:{type(exc).__name__}")
+                        try:
+                            _pants_art_low = (style_prompt or "").lower()
+                            if any(_kw in _pants_art_low for _kw in (
+                                "denim", "jean", "jeans", "blue wash", "light blue wash",
+                            )):
+                                _artifact_base_mask = locals().get(
+                                    "keep_region",
+                                    locals().get("allowed_full", allowed),
+                                )
+                                output, _pants_denim_artifacts = _pp_cleanup_long_pants_denim_artifacts(
+                                    output,
+                                    _artifact_base_mask,
+                                    safe_uint8=_safe_uint8,
+                                )
+                                if int(cv2.countNonZero(_pants_denim_artifacts)) > 20:
+                                    _debug_save("10j_pants_denim_artifact_mask", _pants_denim_artifacts, is_mask=True)
+                                    _debug_save("10k_pants_denim_artifact_clean", output)
+                                    pipeline_info.append("PantsDenimArtifactClean:v19.67")
+                        except Exception as exc:
+                            pipeline_info.append(f"PantsDenimArtifactCleanSkip:{type(exc).__name__}")
+                        try:
+                            if pants_type != "shorts":
+                                _ankle_base_mask = locals().get(
+                                    "keep_region",
+                                    locals().get("allowed_full", allowed),
+                                )
+                                output, _pants_ankle_skin = _pp_restore_long_pants_ankle_skin(
+                                    output,
+                                    person_rgb,
+                                    _ankle_base_mask,
+                                    parsing,
+                                    full_pose,
+                                    safe_uint8=_safe_uint8,
+                                )
+                                if int(cv2.countNonZero(_pants_ankle_skin)) > 20:
+                                    _debug_save("10l_pants_ankle_skin_mask", _pants_ankle_skin, is_mask=True)
+                                    _debug_save("10m_pants_ankle_skin_restore", output)
+                                    pipeline_info.append("PantsAnkleSkinRestore:v19.68")
+                        except Exception as exc:
+                            pipeline_info.append(f"PantsAnkleSkinRestoreSkip:{type(exc).__name__}")
                     else:
                         pipeline_info.append("PantsPoseShapeGuard:skipped(empty)")
                 except Exception as exc:
@@ -7078,7 +7881,11 @@ def try_on(
                 warning_msg = f"{warning_msg}\n{diff_warning}".strip()
             if garment_category == "pants":
                 output = _restore_upper_body_for_pants(output, person_rgb, parsing)
-                pipeline_info.append("PantsUpperBodyRestore:v19.24")
+                pipeline_info.append(
+                    "PantsUpperBodyRestore:v22.23_waist_clip"
+                    if pants_type == "shorts" else
+                    "PantsUpperBodyRestore:v19.24"
+                )
 
     # ═══ HAIR OVERLAY (v16.9c) — SOTA repaint: paste original hair on top ═══
     # Garment extends fully under hair (from Fix A/B/C/D).

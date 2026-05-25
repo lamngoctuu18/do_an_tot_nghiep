@@ -160,6 +160,33 @@ def _build_long_sleeve_mask(pose: dict | None, shape: tuple[int, int]) -> np.nda
     return cv2.GaussianBlur(out, (5, 5), 1.0)
 
 
+def _build_short_sleeve_mask(pose: dict | None, shape: tuple[int, int]) -> np.ndarray:
+    """Small cap/upper-arm envelope for short-sleeve dresses."""
+    out = np.zeros(shape, dtype=np.uint8)
+    if not pose:
+        return out
+    ls = _pose_xy(pose, "left_shoulder")
+    rs = _pose_xy(pose, "right_shoulder")
+    shoulder_w = 60.0
+    if ls and rs:
+        shoulder_w = max(40.0, float(np.hypot(ls[0] - rs[0], ls[1] - rs[1])))
+    r = max(9, int(shoulder_w * 0.13))
+    for side in ("left", "right"):
+        sh = _pose_xy(pose, f"{side}_shoulder")
+        el = _pose_xy(pose, f"{side}_elbow")
+        if sh is None:
+            continue
+        if el is None:
+            cv2.circle(out, (int(round(sh[0])), int(round(sh[1]))), r, 255, thickness=-1)
+            continue
+        end = (
+            sh[0] + (el[0] - sh[0]) * 0.38,
+            sh[1] + (el[1] - sh[1]) * 0.38,
+        )
+        _stroke_segment(out, sh, end, r)
+    return cv2.GaussianBlur(out, (5, 5), 1.0)
+
+
 def _hand_only_mask(pose: dict | None, parsing: dict | None, shape: tuple[int, int]) -> np.ndarray:
     """A small half-disc beyond each wrist — protects the HAND only, never paints
     back into the forearm region (which would punch a circular hole inside the
@@ -269,8 +296,7 @@ def build_dress_masks(
         sleeve_target = _build_long_sleeve_mask(pose, shape)
         target = cv2.bitwise_or(target, sleeve_target)
     elif sleeve_type == "short":
-        # only upper arm to elbow
-        sleeve_target = _build_long_sleeve_mask(pose, shape)
+        sleeve_target = _build_short_sleeve_mask(pose, shape)
         target = cv2.bitwise_or(target, sleeve_target)
 
     target = cv2.subtract(target, shoe_protect)
@@ -347,6 +373,10 @@ def build_dress_masks(
         # Unknown sleeve: don't restore arm — let diffusion + cloth reference
         # decide sleeve length. Still protect hands.
         arm_outside = _hand_only_mask(pose, parsing, shape)
+    elif sleeve_type == "sleeveless":
+        arm = cv2.bitwise_or(_safe(parsing, "left_arm", shape), _safe(parsing, "right_arm", shape))
+        arm_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+        arm_outside = cv2.dilate(arm, arm_kernel, iterations=1)
     else:
         arm = cv2.bitwise_or(_safe(parsing, "left_arm", shape), _safe(parsing, "right_arm", shape))
         arm_outside = cv2.subtract(arm, cv2.dilate(target, np.ones((3, 3), np.uint8), iterations=1))

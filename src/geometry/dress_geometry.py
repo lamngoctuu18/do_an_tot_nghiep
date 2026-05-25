@@ -85,10 +85,105 @@ def _round_hem_corners(mask: np.ndarray) -> np.ndarray:
     return _largest_component(out)
 
 
+def _shoulder_from_parsing(
+    parsing: dict | None,
+    shape: tuple[int, int],
+    pose: dict | None = None,
+) -> tuple[tuple[float, float], tuple[float, float], float] | None:
+    """Infer (left_shoulder, right_shoulder, garment_top_y) from upper_clothes
+    + dress + shoulder region of parsing. The widest row in the upper band of
+    the original garment is taken as the real shoulder line — far closer to the
+    actual body than MediaPipe shoulder keypoints, which often sit *inside* the
+    torso and underestimate width."""
+    if not parsing:
+        return None
+    h, w = shape
+    garment = np.zeros((h, w), dtype=np.uint8)
+    upper = np.zeros((h, w), dtype=np.uint8)
+    for key in ("upper_clothes", "dress"):
+        v = parsing.get(key)
+        if v is None:
+            continue
+        if v.shape[:2] != (h, w):
+            v = cv2.resize(v, (w, h), interpolation=cv2.INTER_NEAREST)
+        part = (v > 20).astype(np.uint8) * 255
+        garment = cv2.bitwise_or(garment, part)
+        if key == "upper_clothes":
+            upper = cv2.bitwise_or(upper, part)
+    if int(cv2.countNonZero(garment)) < 400:
+        return None
+    gys = np.where(garment > 0)[0]
+    garment_top_y = float(gys.min()) if len(gys) else 0.0
+
+    source = upper if int(cv2.countNonZero(upper)) >= 120 else garment
+    source = _largest_component(source)
+    ys, _xs = np.where(source > 0)
+    if len(ys) < 50:
+        return None
+    y_top = int(ys.min())
+    y_bot = int(ys.max())
+    band_h = max(10, int((y_bot - y_top + 1) * 0.42))
+    band = source[y_top:min(h, y_top + band_h), :]
+    # Widest row in the top band approximates shoulder line of the worn garment.
+    candidates = []
+    for ry in range(band.shape[0]):
+        row = np.where(band[ry] > 0)[0]
+        if len(row) < 5:
+            continue
+        x_left = int(row.min())
+        x_right = int(row.max())
+        width = int(x_right - x_left + 1)
+        fill_ratio = float(len(row)) / max(1.0, float(width))
+        if fill_ratio < 0.28:
+            continue
+        preferred_y = band.shape[0] * 0.32
+        score = float(width) - abs(float(ry) - preferred_y) * 0.55
+        candidates.append((score, ry, x_left, x_right, width))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda t: -t[0])
+    _score, ry, x_left, x_right, width = candidates[0]
+    if width < 20:
+        return None
+    abs_y = float(y_top + ry)
+    # Enforce symmetry around the body centerline. If parsing of one shoulder
+    # is occluded (hand/bag) the widest row becomes one-sided and the dress
+    # ends up cutting off the obscured shoulder. Centre on pose only (nose +
+    # shoulder/hip midpoint); parsing x-median bends toward whichever side the
+    # bag covers.
+    full_ys, full_xs = np.where(source > 0)
+    cx_candidates: list[float] = []
+    pose_half_lower: float | None = None
+    if pose:
+        nose = pose.get("nose")
+        if nose is not None:
+            cx_candidates.append(float(nose[0]))
+        ls_p = pose.get("left_shoulder")
+        rs_p = pose.get("right_shoulder")
+        if ls_p is not None and rs_p is not None:
+            cx_candidates.append(float(ls_p[0] + rs_p[0]) * 0.5)
+            # Pose shoulder distance is a hard lower bound on shoulder width:
+            # the body cannot be narrower than its skeleton.
+            pose_half_lower = abs(float(ls_p[0] - rs_p[0])) * 0.5
+        lh_p = pose.get("left_hip")
+        rh_p = pose.get("right_hip")
+        if lh_p is not None and rh_p is not None:
+            cx_candidates.append(float(lh_p[0] + rh_p[0]) * 0.5)
+    if not cx_candidates and len(full_xs):
+        cx_candidates.append(float(np.median(full_xs)))
+    cx = float(np.median(cx_candidates)) if cx_candidates else float(x_left + x_right) * 0.5
+    raw_half = (x_right - x_left) * 0.5
+    half = max(raw_half, pose_half_lower or 0.0)
+    x_left_sym = float(cx - half)
+    x_right_sym = float(cx + half)
+    return (x_left_sym, abs_y), (x_right_sym, abs_y), garment_top_y
+
+
 def build_target_silhouette(
     pose: dict,
     dress_analysis: dict,
     frame_shape: tuple[int, int],
+    parsing: dict | None = None,
 ) -> np.ndarray:
     """Return a binary uint8 mask (0/255) of the dress target footprint.
 
@@ -99,6 +194,8 @@ def build_target_silhouette(
 
     ls = _pose_xy(pose, "left_shoulder", (w * 0.40, h * 0.18))
     rs = _pose_xy(pose, "right_shoulder", (w * 0.60, h * 0.18))
+    pose_ls = ls
+    pose_rs = rs
     lh = _pose_xy(pose, "left_hip", (w * 0.42, h * 0.52))
     rh = _pose_xy(pose, "right_hip", (w * 0.58, h * 0.52))
     lk = _pose_xy(pose, "left_knee", (w * 0.44, h * 0.72))
@@ -106,18 +203,42 @@ def build_target_silhouette(
     la = _pose_xy(pose, "left_ankle", (w * 0.45, h * 0.93))
     ra = _pose_xy(pose, "right_ankle", (w * 0.55, h * 0.93))
 
+    # Use parsing as a width/center hint only; keep pose shoulder height.
+    # — fixes elongated-neck artifact caused by MediaPipe placing shoulder
+    # keypoints below the actual garment shoulder.
+    garment_top_y: float | None = None
+    parsing_shoulder = _shoulder_from_parsing(parsing, (h, w), pose=pose)
+    if parsing_shoulder is not None:
+        ls_p, rs_p, garment_top_y = parsing_shoulder
+        pose_c = _midpoint(pose_ls, pose_rs)
+        pose_w = max(_euclid(pose_ls, pose_rs), w * 0.12)
+        raw_cx = (ls_p[0] + rs_p[0]) * 0.5
+        raw_w = abs(rs_p[0] - ls_p[0])
+        cx = float(np.clip(raw_cx, pose_c[0] - pose_w * 0.30, pose_c[0] + pose_w * 0.30))
+        shoulder_w_clamped = float(np.clip(raw_w, pose_w * 0.92, pose_w * 1.28))
+        shoulder_y = float(np.clip((pose_ls[1] + pose_rs[1]) * 0.5, 0.0, h - 1.0))
+        # Order: ls = right side of image when person faces camera in MP
+        # convention. Keep ls = left-of-image vs rs = right-of-image consistent
+        # with MediaPipe (ls.x ≤ rs.x is NOT guaranteed in MP — but for symmetry
+        # of the silhouette it does not matter, we only use midpoint + width).
+        ls = (cx - shoulder_w_clamped * 0.5, shoulder_y)
+        rs = (cx + shoulder_w_clamped * 0.5, shoulder_y)
+
     shoulder_c = _midpoint(ls, rs)
     hip_c = _midpoint(lh, rh)
     knee_c = _midpoint(lk, rk)
     ankle_c = _midpoint(la, ra)
 
     shoulder_w = max(_euclid(ls, rs), 1.0)
-    hip_w = max(_euclid(lh, rh), shoulder_w * 0.85)
+    pose_shoulder_w = max(_euclid(pose_ls, pose_rs), shoulder_w * 0.75, 1.0)
+    hip_w = max(_euclid(lh, rh), pose_shoulder_w * 0.78)
 
     silhouette = (dress_analysis.get("silhouette") or "a_line").lower()
     if silhouette not in DRESS_TEMPLATES:
         silhouette = "a_line"
     template = DRESS_TEMPLATES[silhouette]
+    sleeve = (dress_analysis.get("sleeve") or "auto").lower()
+    neckline = (dress_analysis.get("neckline") or "unknown").lower()
 
     # Extra hem boost for flared silhouettes — the source templates only carry
     # the relative shape; without this multiplier the target ends up looking
@@ -125,9 +246,9 @@ def build_target_silhouette(
     # the hem stays close enough to the body that the dress does not look
     # detached from the figure.
     _hem_boost = {
-        "a_line": 1.32,
-        "fit_and_flare": 1.42,
-        "ball_gown": 1.55,
+        "a_line": 1.14,
+        "fit_and_flare": 1.20,
+        "ball_gown": 1.38,
         "empire": 1.18,
         "sheath": 1.04,
         "shift": 1.10,
@@ -155,7 +276,19 @@ def build_target_silhouette(
         shoulder_c[1] - shoulder_w * 0.20,
         nose_y + shoulder_w * 0.36,
     )
+    torso_h = max(1.0, max(lh[1], rh[1]) - min(ls[1], rs[1]))
+    if neckline in {"strapless", "sweetheart"}:
+        top_y = max(top_y, shoulder_c[1] + torso_h * 0.16)
+    elif neckline in {"off_shoulder", "bardot"}:
+        top_y = max(top_y, shoulder_c[1] + torso_h * 0.08)
+    elif sleeve == "sleeveless":
+        top_y = max(top_y, shoulder_c[1] + torso_h * 0.04)
     top_y = float(max(0.0, top_y))
+
+    # Clamp top to original garment neckline — extending the dress above this
+    # line is what stretches the model's neck visually.
+    if garment_top_y is not None:
+        top_y = max(top_y, float(garment_top_y) - shoulder_w * 0.05)
 
     n_rows = 64
     ys = np.linspace(top_y, hem_y, n_rows)
@@ -163,7 +296,14 @@ def build_target_silhouette(
     pts_left: list[tuple[float, float]] = []
     pts_right: list[tuple[float, float]] = []
 
-    bust_half = shoulder_w * 0.62
+    if neckline in {"strapless", "sweetheart"}:
+        bust_half = shoulder_w * 0.47
+    elif neckline in {"off_shoulder", "bardot"}:
+        bust_half = shoulder_w * 0.56
+    elif sleeve == "sleeveless":
+        bust_half = shoulder_w * 0.54
+    else:
+        bust_half = shoulder_w * 0.62
     hip_half = hip_w * 0.78
 
     fracs = list(SAMPLE_FRACS_DRESS)
@@ -199,6 +339,23 @@ def build_target_silhouette(
 
     poly = np.array(pts_left + pts_right[::-1], dtype=np.int32)
     cv2.fillPoly(out, [poly], 255)
+
+    if neckline in {"off_shoulder", "bardot"}:
+        band = np.zeros_like(out)
+        band_half = int(round(np.clip(shoulder_w * 0.62, pose_shoulder_w * 0.48, pose_shoulder_w * 0.76)))
+        band_h = int(round(np.clip(pose_shoulder_w * 0.10, 7, 16)))
+        band_y = int(round(top_y + band_h * 0.25))
+        cx = int(round(shoulder_c[0]))
+        cv2.ellipse(band, (cx, band_y), (band_half, band_h), 0, 0, 360, 255, -1, lineType=cv2.LINE_AA)
+        out = cv2.bitwise_or(out, band)
+    elif neckline in {"strapless", "sweetheart"}:
+        band = np.zeros_like(out)
+        band_half = int(round(np.clip(shoulder_w * 0.45, pose_shoulder_w * 0.36, pose_shoulder_w * 0.56)))
+        band_h = int(round(np.clip(pose_shoulder_w * 0.075, 6, 12)))
+        band_y = int(round(top_y + band_h * 0.25))
+        cx = int(round(shoulder_c[0]))
+        cv2.ellipse(band, (cx, band_y), (band_half, band_h), 0, 0, 360, 255, -1, lineType=cv2.LINE_AA)
+        out = cv2.bitwise_or(out, band)
 
     out = cv2.morphologyEx(out, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
     out = cv2.GaussianBlur(out, (0, 0), 2.2)
