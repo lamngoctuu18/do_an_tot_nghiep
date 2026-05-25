@@ -46,6 +46,7 @@ const CATEGORY_SLIDER_PRESETS: Record<string, SliderPreset> = {
   // Upper body
   top: { fitScale: 1.08, alpha: 0.72, yOffset: -0.02 },
   tshirt: { fitScale: 1.1, alpha: 0.7, yOffset: -0.02 },
+  shirt: { fitScale: 1.12, alpha: 0.7, yOffset: -0.02 },
   hoodie: { fitScale: 1.18, alpha: 0.68, yOffset: -0.01 },
   jacket: { fitScale: 1.2, alpha: 0.66, yOffset: 0.0 },
   outer: { fitScale: 1.22, alpha: 0.64, yOffset: 0.0 },
@@ -74,6 +75,7 @@ const CATEGORY_DIFFUSION_PRESETS: Record<string, DiffusionPreset> = {
   // Upper
   top: { steps: 22, guidance: 5.0, texture: 0.72 },
   tshirt: { steps: 22, guidance: 5.0, texture: 0.7 },
+  shirt: { steps: 24, guidance: 5.1, texture: 0.68 },
   hoodie: { steps: 24, guidance: 5.2, texture: 0.66 },
   jacket: { steps: 24, guidance: 5.3, texture: 0.64 },
   outer: { steps: 26, guidance: 5.4, texture: 0.62 },
@@ -870,6 +872,7 @@ export default function TryOn() {
                   <optgroup label="Áo">
                     <option value="top">Áo (chung)</option>
                     <option value="tshirt">T-shirt</option>
+                    <option value="shirt">Shirt / Áo sơ mi</option>
                     <option value="hoodie">Hoodie</option>
                     <option value="jacket">Jacket</option>
                     <option value="outer">Áo khoác ngoài</option>

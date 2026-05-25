@@ -113,6 +113,21 @@ def _common_compose(
     # diffusion paint natural folds inside the warped silhouette instead of
     # inventing fabric outside it.
     support = cv2.dilate(garment_mask, np.ones((7, 7), np.uint8), iterations=1)
+    if category == "top" and subtype == "jacket":
+        # Extend support downward so the ribbed hem + side pockets band that
+        # the TPS warp tends to clip is still inside the diffusion mask.
+        # Drop 5% of frame height below the lowest warp pixel (capped so we
+        # don't reach the knees on long-frame inputs).
+        ys_g, _ = np.where(garment_mask > 20)
+        if len(ys_g) > 100:
+            hem_extend = int(h * 0.06)
+            hem_y = min(h - 1, int(ys_g.max()) + hem_extend)
+            xs_g = np.where(garment_mask > 20)[1]
+            x_lo = max(0, int(xs_g.min()) - 6)
+            x_hi = min(w - 1, int(xs_g.max()) + 6)
+            cv2.rectangle(support, (x_lo, int(ys_g.max())), (x_hi, hem_y), 255, thickness=-1)
+        # Light close to seal any small gaps along the hem band.
+        support = cv2.morphologyEx(support, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8), iterations=1)
     if category == "top" and subtype == "hoodie":
         # Drop left_arm/right_arm from the parsing union — they cover the bare
         # arm well beyond the actual sleeve and inflate the shoulder/sleeve
@@ -148,6 +163,15 @@ def _common_compose(
     protect_mask = parsing_union_mask(parsing, protect_keys, shape)
     if int(protect_mask.sum()) > 255 * 20:
         protect_mask = cv2.dilate(protect_mask, np.ones((5, 5), np.uint8), iterations=1)
+        # Jacket subtype: a bomber jacket's ribbed hem + side pockets sit BELOW
+        # the waist, overlapping the parsing "pants" region near the top of the
+        # hip. Subtracting the dilated pants protect there clips the hem and
+        # erases the pockets in the final result. Keep the protect mask, but
+        # carve back the area that still lives INSIDE the warped garment so the
+        # hem zone survives. This applies only to jacket, not generic top.
+        if category == "top" and subtype == "jacket":
+            jacket_keep = cv2.dilate(garment_mask, np.ones((9, 9), np.uint8), iterations=1)
+            protect_mask = cv2.subtract(protect_mask, jacket_keep)
         human_prior = cv2.subtract(human_prior, protect_mask)
 
     if category == "dress":
